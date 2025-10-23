@@ -1,0 +1,9 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "./securoserv/Cargo.toml",
+        "./securoclient/Cargo.toml",
+        "./securo/Cargo.toml"
+    ],
+    // "editor.formatOnSave": true,
+    "rust-analyzer.checkOnSave.command": "clippy",
+}

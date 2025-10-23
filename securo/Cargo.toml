@@ -1,0 +1,44 @@
+[package]
+name = "securo"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+# lto = "fat"
+
+# RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+[profile.dev]
+incremental = true
+debug = true
+
+[dependencies]
+rustls = { version = "0.23.32", default-features = false, features = ["ring"]}
+rustls-pemfile = "2.2.0"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+url = "2.5"
+crypto_box = "0.9.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+urlencoding = "2.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "chrono"] }
+tracing-appender = "0.2.3"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"]}
+subtle = "2.6"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+rand = "0.8.5"
+pqc_kyber = { version = "0.7", features = ["kyber1024"] }
