@@ -1,0 +1,32 @@
+[package]
+name = "securoserv"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+# lto = "fat"
+
+# RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+[profile.dev]
+incremental = true
+debug = true
+
+
+[dependencies]
+securo = {path = "../securo"}
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+actix-web = { version = "4.10.2", features = ["rustls-0_23"]}
+actix-ws = "0.3.0"
+futures-util = "0.3"
+tracing = "0.1.41"
+tracing-subscriber = { version="0.3.19", features = ["env-filter", "chrono"] }
+tracing-appender = "0.2.3"
+uuid = { version = "1.11.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
