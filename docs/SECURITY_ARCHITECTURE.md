@@ -147,7 +147,7 @@ Shared Secret:
 | `encrypted_verifying_key` | string | Server's Ed25519 key encrypted with shared secret |
 | `verifying_key_hmac` | string | HMAC-SHA256 authentication — detects tampering |
 | `kyber_ciphertext` | string | Kyber-1024 encapsulated secret for post-quantum security |
-| `temp_jwt` | string | Temporary JWT valid 10 minutes — use for `/api/auth` |
+| `temp_jwt` | string | Temporary JWT valid 10 minutes — use only for `/api/auth` |
 | `token_type` | string | `Bearer` |
 | `expires_in` | number | `600` seconds |
 
@@ -180,18 +180,18 @@ Shared Secret:
 
 | Endpoint | Method | Auth | Encryption | Purpose |
 |----------|--------|------|-----------|---------|
-| `/api/exchange/stage1` | **GET** | ❌ No | Plain JSON | Server initiates key exchange |
-| `/api/exchange/stage2` | POST | ❌ No | Encrypted | Client responds to stage 1 |
-| `/api/auth` | POST | ✅ stage_token | Encrypted | Client authenticates with license |
-| `/api/unauth` | POST | ✅ access_token | Encrypted | Client logs out (session deleted) |
-| `/api/refresh` | POST | ✅ refresh_token | Encrypted | Client refreshes access token |
-| `/api/encrypted` | POST | ✅ access_token | Encrypted | Receive messages |
-| `/api/encrypted/get` | POST | ✅ access_token | Encrypted | Get pending messages |
-| `/api/encrypted/send` | POST | ✅ access_token | Encrypted | Send encrypted message |
-| `/api/check` | POST | ✅ access_token | Encrypted | Verify license validity |
-| `/api/report` | POST | ✅ access_token | Encrypted | Report user for abuse |
-| `/api/admin/create_license` | POST | ✅ - | Encrypted/Plain | Create new license |
-| `/api/admin/remove_license` | POST | ✅ - | Plain JSON | Revoke license |
+| `/api/exchange/stage1` | GET | No | Plain JSON | Server initiates key exchange |
+| `/api/exchange/stage2` | POST | No | Encrypted | Client responds to stage 1 |
+| `/api/auth` | POST | stage_token | Encrypted | Client authenticates with license |
+| `/api/unauth` | POST | access_token | Encrypted | Client logs out (session deleted) |
+| `/api/refresh` | POST | refresh_token | Encrypted | Client refreshes access token |
+| `/api/encrypted` | POST | access_token | Encrypted | Receive messages |
+| `/api/encrypted/get` | POST | access_token | Encrypted | Get pending messages |
+| `/api/encrypted/send` | POST | access_token | Encrypted | Send encrypted message |
+| `/api/check` | POST | access_token | Encrypted | Verify license validity |
+| `/api/report` | POST | access_token | Encrypted | Report user for abuse |
+| `/api/admin/create_license` | POST | access_token (admin) | Encrypted/Plain | Create new license |
+| `/api/admin/remove_license` | POST | access_token (admin)| Plain JSON | Revoke license |
 
 ---
 

@@ -1,64 +1,84 @@
 use securo::client::crypto::{SecuroClient, EncryptedResponse};
 
-/// Check license validity and ban status
-pub async fn check_license(
+/// Bootstrap: Authenticate with admin license key to get admin session
+/// Returns the (access_token, refresh_token, is_admin) tuple
+pub async fn bootstrap_authenticate(
     client: &reqwest::Client,
     crypto: &SecuroClient,
-    license_id: &str,
-    hwid: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    tracing::debug!("Checking license validity...");
+) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
+    tracing::info!("Bootstrap: Authenticating with admin license key...");
     
+    let admin_license_key = "b7f4c2e9-8d3a-4f1b-9e2c-5a6d7f8e9c1a-admin-bootstrap-key";
     let session_id = crypto.get_session_id()
         .ok_or("Session ID not set")?;
 
-    // Create encrypted request
     let payload = serde_json::json!({
-        "license_id": license_id,
-        "hwid": hwid
+        "license_key": admin_license_key
     });
+    
+    // Encrypt the request with exchange token (which is valid for /auth)
     let encrypted_req = crypto.encrypt_request(session_id, payload)?;
     
     let resp = client
-        .post("https://127.0.0.1:8443/api/check")
+        .post("https://127.0.0.1:8443/api/auth")
         .json(&encrypted_req)
         .send()
         .await?;
     
     if !resp.status().is_success() {
-        let status = resp.status();
-        let error_body = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        let error_msg = format!("License check failed: Status {} - {}", status, error_body);
+        let error_msg = format!("Failed to bootstrap authenticate: Status {}", resp.status());
+        tracing::error!("{}", error_msg);
         return Err(error_msg.into());
     }
     
     // Decrypt the response
     let encrypted_resp: EncryptedResponse = resp.json().await?;
-    let decrypted_response = crypto.decrypt_response(&encrypted_resp)?;
-    let response_text = decrypted_response.to_string();
+    let response_data = crypto.decrypt_response(&encrypted_resp)?;
     
-    tracing::debug!("License check result: {}", response_text);
+    let access_token = response_data.get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or("No access_token in response")?
+        .to_string();
     
-    Ok(response_text)
+    let refresh_token = response_data.get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or("No refresh_token in response")?
+        .to_string();
+    
+    // Extract is_admin flag from response
+    let is_admin = response_data.get("is_admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    
+    tracing::info!("✅ Bootstrap authentication successful - session is now admin (is_admin: {})", is_admin);
+    
+    Ok((access_token, refresh_token, is_admin))
 }
 
-/// Create a license (admin operation)
+/// Create a license (admin operation - requires is_admin=true in payload)
 pub async fn create_license(
     client: &reqwest::Client,
-    temp_jwt_session_id: &str,
+    crypto: &SecuroClient,
+    is_admin: bool,
     expires_in: Option<u64>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     tracing::info!("Creating license for session...");
     
+    let session_id = crypto.get_session_id()
+        .ok_or("Session ID not set")?;
 
-    let mut payload = serde_json::json!({"session_id": temp_jwt_session_id});
+    let mut payload = serde_json::json!({
+        "is_admin": is_admin,
+    });
     if let Some(exp) = expires_in {
         payload["expires_in"] = serde_json::json!(exp);
     }
     
+    let encrypted_req = crypto.encrypt_request(session_id, payload)?;
+    
     let resp = client
         .post("https://127.0.0.1:8443/api/admin/create_license")
-        .json(&payload)
+        .json(&encrypted_req)
         .send()
         .await?;
     
@@ -68,9 +88,8 @@ pub async fn create_license(
         return Err(error_msg.into());
     }
     
-    let license_data: serde_json::Value = resp.json().await?;
-    tracing::info!("✅ License created successfully");
-    tracing::info!("License data: {}", serde_json::to_string_pretty(&license_data)?);
+    let encrypted_resp: EncryptedResponse = resp.json().await?;
+    let license_data = crypto.decrypt_response(&encrypted_resp)?;
     
     Ok(license_data)
 }
@@ -78,15 +97,23 @@ pub async fn create_license(
 /// Remove a license (admin operation)
 pub async fn remove_license(
     client: &reqwest::Client,
-    license_id: &str,
+    crypto: &SecuroClient,
+    license_key: &str,
+    is_admin: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    tracing::info!("Removing license: {}", license_id);
+    let session_id = crypto.get_session_id()
+        .ok_or("Session ID not set")?;
     
-    let payload = serde_json::json!({"license_id": license_id});
+    let payload = serde_json::json!({
+        "license_key": license_key,
+        "is_admin": is_admin,
+    });
+    
+    let encrypted_req = crypto.encrypt_request(session_id, payload)?;
     
     let resp = client
         .post("https://127.0.0.1:8443/api/admin/remove_license")
-        .json(&payload)
+        .json(&encrypted_req)
         .send()
         .await?;
     
@@ -96,8 +123,49 @@ pub async fn remove_license(
         return Err(error_msg.into());
     }
     
-    let response_text = resp.text().await?;
-    tracing::info!("✅ License removed: {}", response_text);
+    let encrypted_resp: EncryptedResponse = resp.json().await?;
+    let response_data = crypto.decrypt_response(&encrypted_resp)?;
+    
+    let response_text = serde_json::to_string(&response_data)?;
     
     Ok(response_text)
+}
+
+/// Check if a license is valid
+pub async fn check_license(
+    client: &reqwest::Client,
+    crypto: &SecuroClient,
+    license_key: &str,
+    hwid: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let session_id = crypto.get_session_id()
+        .ok_or("Session ID not set")?;
+    
+    let payload = serde_json::json!({
+        "license_key": license_key,
+        "hwid": hwid
+    });
+    
+    let encrypted_req = crypto.encrypt_request(session_id, payload)?;
+    
+    let resp = client
+        .post("https://127.0.0.1:8443/api/check")
+        .json(&encrypted_req)
+        .send()
+        .await?;
+    
+    if !resp.status().is_success() {
+        let error_msg = format!("License check failed: Status {}", resp.status());
+        tracing::error!("{}", error_msg);
+        return Err(error_msg.into());
+    }
+    
+    let encrypted_resp: EncryptedResponse = resp.json().await?;
+    let response_data = crypto.decrypt_response(&encrypted_resp)?;
+    
+    let is_valid = response_data.get("valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    
+    Ok(is_valid.to_string())
 }

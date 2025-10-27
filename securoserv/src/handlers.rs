@@ -1,15 +1,18 @@
 use actix_web::{http::StatusCode, web, HttpResponse};
 use serde::Serialize;
+use chrono::Utc;
+use uuid::Uuid;
 
-use crate::license::{
-    LicenseManager, BanManager
-};
+use crate::db::{self, DbPool, Ban, AuditLog, License};
 use securo::server::crypto::{SecuroServ, EncryptedRequest, ExchangeStage2Request};
+
+/// Admin license key - used for bootstrapping admin session creation
+const ADMIN_LICENSE_KEY: &str = "b7f4c2e9-8d3a-4f1b-9e2c-5a6d7f8e9c1a-admin-bootstrap-key";
 
 /// Admin: create a license for a session_id
 pub async fn admin_create_license(
-    license_manager: web::Data<LicenseManager>,
     crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
     req: web::Bytes,
 ) -> HttpResponse {
 
@@ -25,71 +28,146 @@ pub async fn admin_create_license(
 
         tracing::info!("Admin create license request (encrypted) from session: {}", &session_id[..std::cmp::min(40, session_id.len())]);
 
-        let expires_in = payload.get("expires_in").and_then(|v| v.as_u64());
-
-        let lic = license_manager.create_license(&session_id, expires_in);
+        // Check if request includes is_admin flag
+        let is_admin = payload.get("is_admin")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         
-        let response = serde_json::json!(lic);
-        match crypto.encrypt_response(&session_id, response) {
-            Ok(encrypted_resp) => {
-                tracing::info!("License created, response encrypted");
-                HttpResponse::Ok().json(encrypted_resp)
+        if !is_admin {
+            tracing::warn!("Rejected admin_create_license: request is not marked as admin");
+            return HttpResponse::Unauthorized().body("Not an admin session");
+        }
+
+        let expires_in = payload.get("expires_in").and_then(|v| v.as_u64());
+        
+        // Create license in database
+        let license_id = Uuid::new_v4().to_string();
+        let license_key = Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp();
+        let expires_at = expires_in.map(|e| now + e as i64).unwrap_or(now + 2592000);
+        
+        let db_license = License {
+            id: license_id.clone(),
+            license_key: license_key.clone(),
+            created_at: now,
+            expires_at,
+            is_revoked: false,
+            max_connections: 1,
+            license_type: "standard".to_string(),
+        };
+        
+        match db::insert_license(&db, db_license) {
+            Ok(_) => {
+                let audit = AuditLog {
+                    id: Uuid::new_v4().to_string(),
+                    session_uuid: Some(session_id.clone()),
+                    event_type: "license_create".to_string(),
+                    event_data: serde_json::json!({"license_key": license_key}).to_string(),
+                    created_at: now,
+                    ip_address: None,
+                };
+                if let Err(e) = db::insert_audit_log(&db, audit) {
+                    tracing::error!("Failed to save audit log: {:?}", e);
+                }
+                
+                let response = serde_json::json!({
+                    "license_id": license_key,
+                    "expires_at": expires_at
+                });
+                
+                match crypto.encrypt_response(&session_id, response) {
+                    Ok(encrypted_resp) => HttpResponse::Ok().json(encrypted_resp),
+                    Err(e) => {
+                        tracing::error!("Failed to encrypt response: {:?}", e);
+                        HttpResponse::InternalServerError().body("Encryption failed")
+                    }
+                }
             }
             Err(e) => {
-                tracing::error!("Failed to encrypt admin_create_license response: {:?}", e);
-                HttpResponse::InternalServerError().body("Encryption failed")
+                tracing::error!("Failed to create license: {:?}", e);
+                HttpResponse::InternalServerError().body("Failed to create license")
             }
         }
     } else {
-
-        match serde_json::from_slice::<serde_json::Value>(&req) {
-            Ok(plain_req) => {
-                let session_id = match plain_req.get("session_id").and_then(|v| v.as_str()) {
-                    Some(s) => s,
-                    None => return HttpResponse::BadRequest().body("session_id required"),
-                };
-
-                let expires_in = plain_req.get("expires_in").and_then(|v| v.as_u64());
-
-                tracing::info!("Admin create license request (plain) from session: {}", &session_id[..std::cmp::min(40, session_id.len())]);
-
-                let lic = license_manager.create_license(session_id, expires_in);
-                HttpResponse::Ok().json(lic)
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse admin_create_license request: {:?}", e);
-                HttpResponse::BadRequest().body("Invalid request format")
-            }
-        }
+        tracing::error!("Failed to deserialize EncryptedRequest from bytes");
+        HttpResponse::BadRequest().body("Invalid request format")
     }
 }
 
-
 pub async fn admin_remove_license(
-    license_manager: web::Data<LicenseManager>,
-    req: web::Json<serde_json::Value>,
+    crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
+    req: web::Bytes,
 ) -> HttpResponse {
-    let session_id = req.get("session_id").and_then(|v| v.as_str());
-    let license_id = req.get("license_id").and_then(|v| v.as_str());
 
-    let key_to_remove = license_id.or(session_id);
+    if let Ok(encrypted_req) = serde_json::from_slice::<EncryptedRequest>(&req) {
+        let (session_id, payload) = match crypto.decrypt_request(&encrypted_req) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to decrypt admin_remove_license request: {:?}", e);
+                e.log_security_event();
+                return HttpResponse::Unauthorized().body("Decryption failed");
+            }
+        };
 
-    match key_to_remove {
-        Some(key) => {
-            if license_manager.remove_license(key) {
-                HttpResponse::Ok().body("removed")
-            } else {
-                HttpResponse::NotFound().body("not found")
+        tracing::info!("Admin remove license request (encrypted) from session: {}", &session_id[..std::cmp::min(40, session_id.len())]);
+
+        // Check if request includes is_admin flag
+        let is_admin = payload.get("is_admin")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        
+        if !is_admin {
+            tracing::warn!("Rejected admin_remove_license: request is not marked as admin");
+            return HttpResponse::Unauthorized().body("Not an admin session");
+        }
+
+        let license_key = match payload.get("license_key").and_then(|v| v.as_str()) {
+            Some(key) => key,
+            None => {
+                return HttpResponse::BadRequest().body("license_key required");
+            }
+        };
+
+        // Revoke license in database
+        match db::revoke_license(&db, license_key) {
+            Ok(_) => {
+                // Audit log
+                let audit = AuditLog {
+                    id: Uuid::new_v4().to_string(),
+                    session_uuid: Some(session_id.clone()),
+                    event_type: "license_revoke".to_string(),
+                    event_data: serde_json::json!({"license_key": license_key}).to_string(),
+                    created_at: Utc::now().timestamp(),
+                    ip_address: None,
+                };
+                if let Err(e) = db::insert_audit_log(&db, audit) {
+                    tracing::error!("Failed to save audit log: {:?}", e);
+                }
+                
+                let response = serde_json::json!({"status": "revoked"});
+                match crypto.encrypt_response(&session_id, response) {
+                    Ok(encrypted_resp) => HttpResponse::Ok().json(encrypted_resp),
+                    Err(e) => {
+                        tracing::error!("Failed to encrypt response: {:?}", e);
+                        HttpResponse::InternalServerError().body("Encryption failed")
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("❌ Failed to revoke license: {:?}", e);
+                HttpResponse::InternalServerError().body("Failed to revoke license")
             }
         }
-        None => HttpResponse::BadRequest().body("license_id or session_id required"),
+    } else {
+        tracing::error!("Failed to deserialize EncryptedRequest from bytes");
+        HttpResponse::BadRequest().body("Invalid request format")
     }
 }
 
 pub async fn check_license(
-    license_manager: web::Data<LicenseManager>,
-    ban_manager: web::Data<BanManager>,
     crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
     req: web::Bytes,
 ) -> HttpResponse {
 
@@ -103,15 +181,13 @@ pub async fn check_license(
             }
         };
 
-        tracing::info!("Check license request (encrypted) from session: {}", &session_id[..std::cmp::min(40, session_id.len())]);
-
-        let license_id = payload.get("license_id").and_then(|v| v.as_str());
+        let license_key = payload.get("license_key").and_then(|v| v.as_str());
         
-        if license_id.is_none() {
-            let error_resp = serde_json::json!({"error": "license_id required"});
+        if license_key.is_none() {
+            let error_resp = serde_json::json!({"error": "license_key required"});
             return match crypto.encrypt_response(&session_id, error_resp) {
                 Ok(encrypted_err) => HttpResponse::BadRequest().json(encrypted_err),
-                Err(_) => HttpResponse::BadRequest().body("license_id required"),
+                Err(_) => HttpResponse::BadRequest().body("license_key required"),
             };
         }
 
@@ -126,8 +202,12 @@ pub async fn check_license(
             }
         };
 
-        // Check if banned
-        if ban_manager.is_banned((session_id.as_str(), hwid)) {
+        // Check if banned by session_id or hwid
+        let is_banned_session = db::is_entity_banned(&db, &session_id).unwrap_or_default();
+        
+        let is_banned_hwid = db::is_entity_banned(&db, hwid).unwrap_or_default();
+
+        if is_banned_session || is_banned_hwid {
             let error_resp = serde_json::json!({"status": "banned"});
             return match crypto.encrypt_response(&session_id, error_resp) {
                 Ok(encrypted_resp) => HttpResponse::Forbidden().json(encrypted_resp),
@@ -136,7 +216,14 @@ pub async fn check_license(
         }
 
         // Check license validity
-        let is_valid = license_id.map(|lid| license_manager.check_license(lid)).unwrap_or(false);
+        let is_valid = match db::get_license_by_key(&db, license_key.unwrap_or("")) {
+            Ok(Some(lic)) => !lic.is_revoked && lic.expires_at > Utc::now().timestamp(),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::error!("Failed to check license: {:?}", e);
+                false
+            }
+        };
 
         let response = serde_json::json!({
             "status": if is_valid { "valid" } else { "invalid or expired" }
@@ -153,67 +240,74 @@ pub async fn check_license(
             }
         }
     } else {
-
-        match serde_json::from_slice::<serde_json::Value>(&req) {
-            Ok(plain_req) => {
-                let session_id = plain_req.get("session_id").and_then(|v| v.as_str());
-                let license_id = plain_req.get("license_id").and_then(|v| v.as_str());
-                
-                if session_id.is_none() && license_id.is_none() {
-                    return HttpResponse::BadRequest().body("session_id or license_id required");
-                }
-
-                let hwid = match plain_req.get("hwid").and_then(|v| v.as_str()) {
-                    Some(h) => h,
-                    None => return HttpResponse::BadRequest().body("hwid required"),
-                };
-
-                // Check if banned first (using session_id if available)
-                if let Some(sid) = session_id
-                    && ban_manager.is_banned((sid, hwid)) {
-                        return HttpResponse::Forbidden().body("banned");
-                    }
-
-                // Check license validity - try license_id first, then fall back to session_id
-                let is_valid = if let Some(lid) = license_id {
-                    license_manager.check_license(lid)
-                } else if let Some(sid) = session_id {
-                    license_manager.check_license(sid)
-                } else {
-                    false
-                };
-
-                if is_valid {
-                    HttpResponse::Ok().body("valid")
-                } else {
-                    HttpResponse::Forbidden().body("invalid or expired")
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse check_license request: {:?}", e);
-                HttpResponse::BadRequest().body("Invalid request format")
-            }
-        }
+        HttpResponse::BadRequest().body("Invalid request format")
     }
 }
 
 /// Report debugger detection from client: bans a session-id reported by client
 pub async fn report(
-    ban_manager: web::Data<BanManager>,
-    req: web::Json<serde_json::Value>,
+    crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
+    req: web::Bytes,
 ) -> HttpResponse {
-    let session_id = match req.get("session_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return HttpResponse::BadRequest().body("session_id required"),
-    };
+    if let Ok(encrypted_req) = serde_json::from_slice::<EncryptedRequest>(&req) {
+        let (session_id, payload) = match crypto.decrypt_request(&encrypted_req) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to decrypt report request: {:?}", e);
+                e.log_security_event();
+                return HttpResponse::Unauthorized().body("Decryption failed");
+            }
+        };
 
-    let hwid = match req.get("hwid").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return HttpResponse::BadRequest().body("hwid required"),
-    };
+        let hwid = match payload.get("hwid").and_then(|v| v.as_str()) {
+            Some(h) => h,
+            None => {
+                let error_resp = serde_json::json!({"error": "hwid required"});
+                return match crypto.encrypt_response(&session_id, error_resp) {
+                    Ok(encrypted_err) => HttpResponse::BadRequest().json(encrypted_err),
+                    Err(_) => HttpResponse::BadRequest().body("hwid required"),
+                };
+            }
+        };
 
-    ban_manager.ban((session_id, hwid), "client-reported debugger");
-    HttpResponse::Ok().body("banned")
+        // Ban by session_id
+        let ban = Ban {
+            id: Uuid::new_v4().to_string(),
+            banned_entity: session_id.to_string(),
+            ban_type: "session".to_string(),
+            reason: "client-reported debugger".to_string(),
+            created_at: Utc::now().timestamp(),
+            banned_by: None,
+        };
+        if let Err(e) = db::insert_ban(&db, ban) {
+            tracing::error!("Failed to save ban to database: {:?}", e);
+        }
+        
+        // Also ban by HWID
+        let hwid_ban = Ban {
+            id: Uuid::new_v4().to_string(),
+            banned_entity: hwid.to_string(),
+            ban_type: "hardware".to_string(),
+            reason: "client-reported debugger".to_string(),
+            created_at: Utc::now().timestamp(),
+            banned_by: None,
+        };
+        if let Err(e) = db::insert_ban(&db, hwid_ban) {
+            tracing::error!("Failed to save HWID ban to database: {:?}", e);
+        }
+
+        let response = serde_json::json!({"status": "banned"});
+        match crypto.encrypt_response(&session_id, response) {
+            Ok(encrypted_resp) => HttpResponse::Ok().json(encrypted_resp),
+            Err(e) => {
+                tracing::error!("Failed to encrypt report response: {:?}", e);
+                HttpResponse::InternalServerError().body("Encryption failed")
+            }
+        }
+    } else {
+        HttpResponse::BadRequest().body("Invalid request format")
+    }
 }
 
 /// Stage 1 of secure key exchange - Server sends ephemeral key
@@ -266,11 +360,12 @@ pub async fn exchange_stage2(
 /// Authentication - validates license, returns permanent access & refresh tokens
 pub async fn auth(
     crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
     req: web::Json<EncryptedRequest>,
-    license_manager: web::Data<LicenseManager>,
 ) -> HttpResponse {
-    // Decrypt the request - extracts session_id from payload
-    let (session_id, payload) = match crypto.decrypt_request(&req) {
+    // Use decrypt_auth_request which accepts BOTH access and exchange tokens
+    // Regular endpoints must use decrypt_request which only accepts access tokens
+    let (session_id, payload) = match crypto.decrypt_auth_request(&req) {
         Ok(result) => result,
         Err(e) => {
             tracing::error!("Failed to decrypt auth request: {:?}", e);
@@ -295,13 +390,33 @@ pub async fn auth(
 
     tracing::info!("Validating license_key: {}", license_key);
 
-    // Verify license exists
-    if !license_manager.check_license(license_key) {
+    // Verify license exists and is valid
+    let is_valid_license = match db::get_license_by_key(&db, license_key) {
+        Ok(Some(lic)) => !lic.is_revoked && lic.expires_at > Utc::now().timestamp(),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!("Failed to check license: {:?}", e);
+            false
+        }
+    };
+
+    if !is_valid_license {
         tracing::warn!("Invalid or missing license_key: {}", license_key);
         let error_resp = serde_json::json!({"error": "invalid license_key"});
         return match crypto.encrypt_response(&session_id, error_resp) {
             Ok(encrypted_err) => HttpResponse::Forbidden().json(encrypted_err),
             Err(_) => HttpResponse::Forbidden().body("invalid license_key"),
+        };
+    }
+
+    // Check if the license itself is banned
+    let is_license_banned = db::is_entity_banned(&db, license_key).unwrap_or_default();
+    if is_license_banned {
+        tracing::warn!("License is banned: {}", license_key);
+        let error_resp = serde_json::json!({"error": "license is banned"});
+        return match crypto.encrypt_response(&session_id, error_resp) {
+            Ok(encrypted_err) => HttpResponse::Forbidden().json(encrypted_err),
+            Err(_) => HttpResponse::Forbidden().body("license is banned"),
         };
     }
 
@@ -324,6 +439,12 @@ pub async fn auth(
 
     tracing::info!("Processing authenticated session with license: {}", license_key);
 
+    // Check if this is the admin bootstrap license - if so, mark the session as admin
+    let is_admin = license_key == ADMIN_LICENSE_KEY;
+    if is_admin {
+        tracing::warn!("⚠️ Admin session authenticated - marking session as admin");
+    }
+
     // Generate permanent tokens
     match crypto.generate_token_pair(&session_uuid) {
         Ok(token_pair) => {
@@ -333,6 +454,7 @@ pub async fn auth(
                 refresh_token: String,
                 token_type: String,
                 expires_in: u64,
+                is_admin: bool,
             }
 
             let response = AuthSuccessResponse {
@@ -340,9 +462,10 @@ pub async fn auth(
                 refresh_token: token_pair.refresh_token,
                 token_type: token_pair.token_type,
                 expires_in: token_pair.expires_in,
+                is_admin,
             };
 
-            tracing::info!("Authentication successful for session: {}", session_uuid);
+            tracing::info!("Authentication successful for session: {} (admin: {})", session_uuid, is_admin);
             
             match crypto.encrypt_response(&session_id, serde_json::to_value(&response).unwrap_or(serde_json::json!({}))) {
                 Ok(encrypted_resp) => HttpResponse::Ok().json(encrypted_resp),

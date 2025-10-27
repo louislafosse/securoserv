@@ -1,5 +1,5 @@
 mod handlers;
-mod license;
+mod db;
 
 use tracing::info;
 
@@ -71,11 +71,23 @@ async fn main() -> std::io::Result<()> {
 
     let use_tls = std::env::var("USE_TLS").unwrap_or_default() == "true";
 
+    // Initialize SQLite database
+    let db_pool = db::init::init_db()
+        .expect("Failed to initialize database");
+    
+    db::init::run_migrations(&db_pool)
+        .expect("Failed to run database migrations");
+
+    // Initialize admin license for bootstrapping
+    db::init::init_admin_license(&db_pool)
+        .expect("Failed to initialize admin license");
+
+    tracing::info!("✅ Database initialized");
+
     // Create the server crypto instance (shared across all workers - session-based with UUID)
     let server_crypto = web::Data::new(SecuroServ::new());
 
-    let license_manager = web::Data::new(license::LicenseManager::new(std::path::PathBuf::from("data/licenses.json")));
-    let ban_manager = web::Data::new(license::BanManager::new(std::path::PathBuf::from("data/bans.json")));
+    let db_data = web::Data::new(db_pool);
     
     if use_tls {
         info!("Server starting with TLS and certificate pinning on https://127.0.0.1:8443/");
@@ -88,8 +100,7 @@ async fn main() -> std::io::Result<()> {
         HttpServer::new(move || {
             App::new()
                 .app_data(server_crypto.clone())
-                .app_data(license_manager.clone())
-                .app_data(ban_manager.clone())
+                .app_data(db_data.clone())
                 .wrap(Logger::default())
                 .service(configure_routes())
         })
@@ -102,8 +113,7 @@ async fn main() -> std::io::Result<()> {
         HttpServer::new(move || {
             App::new()
                 .app_data(server_crypto.clone())
-                .app_data(license_manager.clone())
-                .app_data(ban_manager.clone())
+                .app_data(db_data.clone())
                 .wrap(Logger::default())
                 .service(configure_routes())
         })

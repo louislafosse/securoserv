@@ -59,6 +59,7 @@ pub struct AuthResponse {
     pub refresh_token: String,
     pub token_type: String,
     pub expires_in: u64,
+    pub is_admin: bool,
 }
 
 /// Client requests server's ephemeral key
@@ -230,7 +231,7 @@ pub async fn exchange_keys_stage2(
 /// Returns permanent access & refresh tokens
 pub async fn auth(
     client: &reqwest::Client,
-    crypto: &SecuroClient,
+    crypto: &mut SecuroClient,
     license_key: &str,
 ) -> Result<AuthResponse, Box<dyn std::error::Error>> {
     tracing::info!("Sending encrypted authentication with license key");

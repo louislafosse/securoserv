@@ -1,3 +1,5 @@
+use securo::client::crypto::{SecuroClient, EncryptedResponse};
+
 #[inline(always)]
 pub fn detect_from_procfs() -> bool {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -34,32 +36,32 @@ pub fn get_machine_id() -> Result<String, Box<dyn std::error::Error>> {
 
 pub async fn report_debugger_detection(
     client: &reqwest::Client,
-    session_id: &str,
+    crypto: &SecuroClient,
     hwid: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::warn!("🚨 Debugger detected! Reporting to server...");
+    tracing::warn!("Debugger detected! Reporting to server...");
     
-    #[derive(serde::Serialize)]
-    struct ReportRequest {
-        session_id: String,
-        hwid: String,
-    }
+    let session_id = crypto.get_session_id()
+        .ok_or("Session ID not set")?;
     
-    let report_req = ReportRequest {
-        session_id: session_id.to_string(),
-        hwid: hwid.to_string(),
-    };
+    let payload = serde_json::json!({
+        "hwid": hwid
+    });
+    
+    let encrypted_req = crypto.encrypt_request(session_id, payload)?;
     
     let resp = client
         .post("https://127.0.0.1:8443/api/report")
-        .json(&report_req)
+        .json(&encrypted_req)
         .send()
         .await?;
     
     if resp.status().is_success() {
+        let encrypted_resp: EncryptedResponse = resp.json().await?;
+        let _response_data = crypto.decrypt_response(&encrypted_resp)?;
         tracing::info!("✅ Debugger report sent successfully");
     } else {
-        tracing::error!("❌ Failed to report debugger: Status {}", resp.status());
+        tracing::error!("Failed to report debugger: Status {}", resp.status());
     }
     
     Ok(())
@@ -68,7 +70,7 @@ pub async fn report_debugger_detection(
 /// Background task to continuously monitor for debuggers
 pub async fn debugger_monitor_task(
     client: reqwest::Client,
-    session_id: String,
+    crypto: SecuroClient,
     hwid: String,
 ) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -79,14 +81,14 @@ pub async fn debugger_monitor_task(
         #[cfg(target_os = "linux")]
         {
             if detect_from_procfs() {
-                tracing::warn!("🔍 Debugger detected via /proc/self/status!");
+                tracing::warn!("Debugger detected via /proc/self/status!");
                 
                 // Report to server
-                if let Err(e) = report_debugger_detection(&client, &session_id, &hwid).await {
+                if let Err(e) = report_debugger_detection(&client, &crypto, &hwid).await {
                     tracing::error!("Failed to report debugger: {}", e);
                 } else {
                     tracing::warn!("⚠️ Machine ID {} has been banned by server", hwid);
-                    tracing::error!("❌ Terminating client due to debugger detection");
+                    tracing::error!("Terminating client due to debugger detection");
                     std::process::exit(1);
                 }
             }
@@ -95,14 +97,14 @@ pub async fn debugger_monitor_task(
         #[cfg(target_os = "windows")]
         {
             if unsafe { winapi::um::debugapi::IsDebuggerPresent() } != 0 {
-                tracing::warn!("🔍 Debugger detected via IsDebuggerPresent!");
+                tracing::warn!("Debugger detected via IsDebuggerPresent!");
                 
                 // Report to server
-                if let Err(e) = report_debugger_detection(&client, &session_id, &hwid).await {
+                if let Err(e) = report_debugger_detection(&client, &crypto, &hwid).await {
                     tracing::error!("Failed to report debugger: {}", e);
                 } else {
                     tracing::warn!("⚠️ Machine ID {} has been banned by server", hwid);
-                    tracing::error!("❌ Terminating client due to debugger detection");
+                    tracing::error!("Terminating client due to debugger detection");
                     std::process::exit(1);
                 }
             }

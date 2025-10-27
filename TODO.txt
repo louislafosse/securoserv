@@ -1,12 +1,4 @@
+FIX:
+...
 
-Integrate it with inMemory or via file directly
-    https://github.com/rusqlite/rusqlite
-Maybe I will use https://github.com/diesel-rs/diesel instead
-https://docs.rs/diesel/latest/diesel/prelude/struct.SqliteConnection.html
-
-also, imp it so we dont have to iterate through sessions anymore in decrypt request
-
-encrypt /report req and route
-encrypt /admin/remove_license req and route
-
-at the end, just clean and publish securo as a lib
+at the end, just clean up and publish securo as a lib

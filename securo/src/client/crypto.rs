@@ -23,10 +23,11 @@ pub struct EncryptedMessage {
     pub timestamp: i64,
 }
 
-/// Encrypted request: all fields including session_id and token are encrypted
+/// Encrypted request: client includes session_id for O(1) server-side lookup
 /// Used for all authenticated API calls after /api/auth
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EncryptedRequest {
+    pub session_id: String,         // Client's session UUID - enables O(1) server lookup
     pub nonce: String,
     pub ciphertext: String,
     pub timestamp: i64,             // Unix timestamp (seconds) - for TTL validation
@@ -262,8 +263,9 @@ impl SecuroClient {
         Ok(plaintext)
     }
 
-    /// Encrypt a encrypted request with the session_id and payload encrypted together
-    /// Wraps the request in: { session_id: token, payload: actual_payload }
+    /// Encrypt a request with session_id sent in plaintext
+    /// The session_id is not encrypted, allowing the server to route to correct session immediately
+    /// The payload (including sensitive data) is encrypted
     pub fn encrypt_request(
         &self,
         session_id: &str,
@@ -271,14 +273,12 @@ impl SecuroClient {
     ) -> Result<EncryptedRequest, Box<dyn std::error::Error>> {
         let salsa_box = self.create_box()?;
 
-        // Create the inner payload with session_id and timestamp
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
             
         let inner_payload = serde_json::json!({
-            "session_id": session_id,
             "payload": payload
         });
 
@@ -293,6 +293,7 @@ impl SecuroClient {
             .map_err(|e| format!("Encryption failed: {:?}", e))?;
 
         Ok(EncryptedRequest {
+            session_id: session_id.to_string(),
             nonce: BASE64_URL_SAFE.encode(&nonce[..]),
             ciphertext: BASE64_URL_SAFE.encode(&ciphertext),
             timestamp: now,

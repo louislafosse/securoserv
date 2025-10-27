@@ -49,6 +49,7 @@ pub struct EncryptedMessage {
 /// Used for all authenticated API calls after /api/auth
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EncryptedRequest {
+    pub session_id: String,         // Client's session UUID - for O(1) lookup
     pub nonce: String,              // 24 random bytes
     pub ciphertext: String,         // contains encrypted JSON payload
     pub timestamp: i64,
@@ -550,7 +551,7 @@ impl SecuroServ {
             // Any deviation indicates a bug in the library or potential tampering
             if ciphertext.len() != KYBER_1024_CIPHERTEXT_SIZE {
                 tracing::error!(
-                    "❌ SECURITY CRITICAL: Kyber encapsulation produced invalid ciphertext length: {} (expected {})",
+                    "⚠️  SECURITY: Kyber encapsulation produced invalid ciphertext length: {} (expected {})",
                     ciphertext.len(),
                     KYBER_1024_CIPHERTEXT_SIZE
                 );
@@ -773,11 +774,28 @@ impl SecuroServ {
     }
 
     /// Decrypt an encrypted request
-    /// Extracts and validates the session_id and decrypts the payload
+    /// Uses client-provided session_id (JWT token) for HashMap lookup
     pub fn decrypt_request(
         &self,
         req: &EncryptedRequest,
     ) -> Result<(String, serde_json::Value), ServerError> {
+        // The session_id is a JWT token - ONLY accept access tokens for regular encrypted requests
+        // This prevents bypass of license checks using exchange tokens
+        let session_uuid = self.validate_access_token(&req.session_id)?;
+
+        // Check timestamp freshness (TTL validation)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ttl_seconds: i64 = 60;  // 60 second TTL for requests
+        
+        if (now - req.timestamp).abs() > ttl_seconds {
+            tracing::warn!("Request timestamp outside TTL window (timestamp: {}, now: {}, ttl: {})", 
+                req.timestamp, now, ttl_seconds);
+            return Err(ServerError::InvalidProof);
+        }
+
         // Decode nonce and ciphertext
         let nonce_bytes = BASE64_URL_SAFE.decode(&req.nonce)
             .map_err(|_| ServerError::InvalidNonce)?;
@@ -792,6 +810,49 @@ impl SecuroServ {
         nonce_array.copy_from_slice(&nonce_bytes);
         let nonce = crypto_box::Nonce::from(nonce_array);
 
+        let mut sessions = self.sessions.write()
+            .map_err(|_| ServerError::InvalidSession)?;
+        
+        let session_data = sessions.get_mut(&session_uuid)
+            .ok_or(ServerError::SessionNotFound)?;
+
+        // Check for nonce reuse
+        if session_data.used_nonces.contains(&req.nonce) {
+            tracing::warn!("Nonce reuse detected in encrypted request - rejecting");
+            return Err(ServerError::InvalidNonce);
+        }
+        
+        // Decrypt with the session's client key
+        let salsa_box = SalsaBox::new(&session_data.public_key, &self.secret_key);
+        let plaintext = salsa_box.decrypt(&nonce, ciphertext.as_ref())
+            .map_err(|_| ServerError::DecryptionFailed)?;
+
+        // Mark nonce as used
+        session_data.used_nonces.insert(req.nonce.clone());
+
+        let plaintext_str = String::from_utf8(plaintext)
+            .map_err(|_| ServerError::DecryptionFailed)?;
+        let payload: serde_json::Value = serde_json::from_str(&plaintext_str)
+            .map_err(|_| ServerError::DecryptionFailed)?;
+
+        // Extract the actual payload
+        let inner_payload = payload.get("payload")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        Ok((req.session_id.clone(), inner_payload))
+    }
+
+    /// Decrypt a request for the AUTH endpoint ONLY
+    /// This is the ONLY endpoint that should accept exchange tokens
+    /// Regular endpoints must use access tokens (see decrypt_request)
+    pub fn decrypt_auth_request(
+        &self,
+        req: &EncryptedRequest,
+    ) -> Result<(String, serde_json::Value), ServerError> {
+        // The session_id is a JWT token - accept BOTH exchange and access tokens for auth
+        let session_uuid = self.validate_any_token(&req.session_id, &["access", "exchange"])?;
+
         // Check timestamp freshness (TTL validation)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -802,50 +863,54 @@ impl SecuroServ {
         if (now - req.timestamp).abs() > ttl_seconds {
             tracing::warn!("Request timestamp outside TTL window (timestamp: {}, now: {}, ttl: {})", 
                 req.timestamp, now, ttl_seconds);
-            return Err(ServerError::InvalidProof);  // Use InvalidProof for freshness failure
+            return Err(ServerError::InvalidProof);
         }
 
-        // Try decryption with each known session's client key
-        let mut sessions = self.sessions.write().map_err(|_| ServerError::InvalidSession)?;
+        // Decode nonce and ciphertext
+        let nonce_bytes = BASE64_URL_SAFE.decode(&req.nonce)
+            .map_err(|_| ServerError::InvalidNonce)?;
+        let ciphertext = BASE64_URL_SAFE.decode(&req.ciphertext)
+            .map_err(|_| ServerError::InvalidCiphertext)?;
+
+        if nonce_bytes.len() != 24 {
+            return Err(ServerError::InvalidNonce);
+        }
+
+        let mut nonce_array = [0u8; 24];
+        nonce_array.copy_from_slice(&nonce_bytes);
+        let nonce = crypto_box::Nonce::from(nonce_array);
+
+        let mut sessions = self.sessions.write()
+            .map_err(|_| ServerError::InvalidSession)?;
         
-        for session_data in sessions.values_mut() {
-            // Check for nonce reuse
-            if session_data.used_nonces.contains(&req.nonce) {
-                tracing::warn!("Nonce reuse detected in encrypted request - rejecting");
-                return Err(ServerError::InvalidNonce);
-            }
-            
-            // Create box using client's public key
-            let salsa_box = SalsaBox::new(&session_data.public_key, &self.secret_key);
-            if let Ok(plaintext) = salsa_box.decrypt(&nonce, ciphertext.as_ref()) {
-                let plaintext_str = String::from_utf8(plaintext)
-                    .map_err(|_| ServerError::DecryptionFailed)?;
-                let payload: serde_json::Value = serde_json::from_str(&plaintext_str)
-                    .map_err(|_| ServerError::DecryptionFailed)?;
+        let session_data = sessions.get_mut(&session_uuid)
+            .ok_or(ServerError::SessionNotFound)?;
 
-                // Extract session_id from payload
-                let session_id = payload.get("session_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or(ServerError::InvalidSession)?;
-
-                // Validate token (try both access and exchange types silently)
-                let _ = self.validate_any_token(session_id, &["access", "exchange"])?;
-
-                // Mark nonce as used for this session
-                session_data.used_nonces.insert(req.nonce.clone());
-
-                // Extract the actual payload
-                let inner_payload = payload.get("payload")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-
-                tracing::debug!("Request decrypted successfully");
-                return Ok((session_id.to_string(), inner_payload));
-            }
+        // Check for nonce reuse
+        if session_data.used_nonces.contains(&req.nonce) {
+            tracing::warn!("Nonce reuse detected in encrypted request - rejecting");
+            return Err(ServerError::InvalidNonce);
         }
+        
+        // Decrypt with the session's client key
+        let salsa_box = SalsaBox::new(&session_data.public_key, &self.secret_key);
+        let plaintext = salsa_box.decrypt(&nonce, ciphertext.as_ref())
+            .map_err(|_| ServerError::DecryptionFailed)?;
 
-        // If no session could decrypt it, fail
-        Err(ServerError::DecryptionFailed)
+        // Mark nonce as used
+        session_data.used_nonces.insert(req.nonce.clone());
+
+        let plaintext_str = String::from_utf8(plaintext)
+            .map_err(|_| ServerError::DecryptionFailed)?;
+        let payload: serde_json::Value = serde_json::from_str(&plaintext_str)
+            .map_err(|_| ServerError::DecryptionFailed)?;
+
+        // Extract the actual payload
+        let inner_payload = payload.get("payload")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        Ok((req.session_id.clone(), inner_payload))
     }
 
     /// Encrypt a response
