@@ -1,11 +1,11 @@
 use securo::client::crypto::{SecuroClient, EncryptedResponse};
 
 /// Bootstrap: Authenticate with admin license key to get admin session
-/// Returns the (access_token, refresh_token, is_admin) tuple
+/// Returns the (access_token, refresh_token) tuple
 pub async fn bootstrap_authenticate(
     client: &reqwest::Client,
     crypto: &SecuroClient,
-) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
+) -> Result<(String, String), Box<dyn std::error::Error>> {
     tracing::info!("Bootstrap: Authenticating with admin license key...");
     
     let admin_license_key = "b7f4c2e9-8d3a-4f1b-9e2c-5a6d7f8e9c1a-admin-bootstrap-key";
@@ -45,21 +45,15 @@ pub async fn bootstrap_authenticate(
         .ok_or("No refresh_token in response")?
         .to_string();
     
-    // Extract is_admin flag from response
-    let is_admin = response_data.get("is_admin")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    tracing::info!("✅ Bootstrap authentication successful - session is now admin");
     
-    tracing::info!("✅ Bootstrap authentication successful - session is now admin (is_admin: {})", is_admin);
-    
-    Ok((access_token, refresh_token, is_admin))
+    Ok((access_token, refresh_token))
 }
 
-/// Create a license (admin operation - requires is_admin=true in payload)
+/// Create a license (admin operation - server validates if session is admin)
 pub async fn create_license(
     client: &reqwest::Client,
     crypto: &SecuroClient,
-    is_admin: bool,
     expires_in: Option<u64>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     tracing::info!("Creating license for session...");
@@ -67,9 +61,7 @@ pub async fn create_license(
     let session_id = crypto.get_session_id()
         .ok_or("Session ID not set")?;
 
-    let mut payload = serde_json::json!({
-        "is_admin": is_admin,
-    });
+    let mut payload = serde_json::json!({});
     if let Some(exp) = expires_in {
         payload["expires_in"] = serde_json::json!(exp);
     }
@@ -95,18 +87,17 @@ pub async fn create_license(
 }
 
 /// Remove a license (admin operation)
+/// Remove a license (admin operation - server validates if session is admin)
 pub async fn remove_license(
     client: &reqwest::Client,
     crypto: &SecuroClient,
     license_key: &str,
-    is_admin: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let session_id = crypto.get_session_id()
         .ok_or("Session ID not set")?;
     
     let payload = serde_json::json!({
         "license_key": license_key,
-        "is_admin": is_admin,
     });
     
     let encrypted_req = crypto.encrypt_request(session_id, payload)?;

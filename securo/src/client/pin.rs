@@ -1,4 +1,3 @@
-
 use rustls::ClientConfig;
 use rustls::client::danger::{ServerCertVerifier, ServerCertVerified};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -23,7 +22,6 @@ impl ServerCertVerifier for PinningCertVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         // Compare the server certificate with the pinned certificate
         if end_entity.as_ref() == &self.pinned_cert[..] {
-            tracing::info!("Certificate matches pinned certificate");
             Ok(ServerCertVerified::assertion())
         } else {
             tracing::error!("Certificate does NOT match pinned certificate");
@@ -74,21 +72,17 @@ pub fn create_pinned_rustls_config(cert: Vec<u8>) -> Arc<ClientConfig> {
         .expect("error 409")
         .into_owned();
 
-    tracing::info!("🔒 Certificate pinning enabled");
-    tracing::info!("📌 Pinned cert length: {} bytes", pinned_cert.len());
-
     // Create the verifier
     let verifier = Arc::new(PinningCertVerifier {
         pinned_cert: pinned_cert.to_vec(),
     });
 
-    // Configure rustls with empty RootCertStore
+    // Configure rustls with custom certificate pinning verifier
     let root_cert_store = RootCertStore::empty();
     let mut client_config = ClientConfig::builder()
         .with_root_certificates(root_cert_store)
         .with_no_client_auth();
 
-    tracing::info!("Setting SSL pinning");
     client_config
         .dangerous()
         .set_certificate_verifier(verifier);

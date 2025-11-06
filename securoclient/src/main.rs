@@ -47,7 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create pinned HTTP client
     let client = modules::client::create_pinned_client(include_bytes!("../../securoserv/cert.pem").to_vec())?;
-
+    tracing::info!("🔒 Certificate pinning enabled");
+    tracing::info!(" ↪  SSL pinning set");
 
     tracing::info!("Test 1: Testing server connection...");
     match client.get("https://127.0.0.1:8443/").send().await {
@@ -123,20 +124,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Send encrypted authentication with admin license key - get admin tokens
     tracing::info!("Test 3: Sending encrypted authentication with admin license...");
     let admin_license_key = "b7f4c2e9-8d3a-4f1b-9e2c-5a6d7f8e9c1a-admin-bootstrap-key";
-    // Auth is now immutable - is_admin comes from response
     let auth_response = modules::auth::auth(&client, &mut crypto, admin_license_key).await?;
     let admin_access_token = auth_response.access_token.clone();
     let _admin_refresh_token = auth_response.refresh_token.clone();
-    let is_admin = auth_response.is_admin;  // Extract is_admin flag from response
     // Update session_id to admin access token for admin operations
     crypto.set_session_id(admin_access_token.clone());
-    tracing::info!("✅ Admin authenticated (is_admin: {})", is_admin);
+    tracing::info!("✅ Admin authenticated");
     tracing::info!("");
 
     // Now create our first user license using admin session
     tracing::info!("Test 4: Creating first user license...");
     let (access_token, refresh_token, license_key) = {
-        match modules::license::create_license(&client, &crypto, is_admin, Some(86400)).await {
+        match modules::license::create_license(&client, &crypto, Some(86400)).await {
             Ok(license_data) => {
                 tracing::info!("✅ User license created\n");
                 
@@ -227,14 +226,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✅ Key exchange completed");
     
     tracing::info!("Test 7.6: Bootstrap admin authentication...");
-    let (admin_access_token, _admin_refresh_token, bootstrap_is_admin) = modules::license::bootstrap_authenticate(&client, &crypto).await?;
-    tracing::info!("✅ Admin session authenticated (is_admin: {})\n", bootstrap_is_admin);
+    let (admin_access_token, _admin_refresh_token) = modules::license::bootstrap_authenticate(&client, &crypto).await?;
+    tracing::info!("✅ Admin session authenticated\n");
     
     // Update crypto to use admin access token
     crypto.set_session_id(admin_access_token);
 
     tracing::info!("Test 8: Creating license (admin demo)...");
-    match modules::license::create_license(&client, &crypto, bootstrap_is_admin, None).await {
+    match modules::license::create_license(&client, &crypto, None).await {
         Ok(lic_data) => {
             tracing::info!("✅ License created : {:?}", lic_data);
             // Store license_id for removal test
@@ -243,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or("unknown");            
 
             tracing::info!("Test 9: Removing license (admin demo)...");
-            match modules::license::remove_license(&client, &crypto, remove_lic_id, bootstrap_is_admin).await {
+            match modules::license::remove_license(&client, &crypto, remove_lic_id).await {
                 Ok(result) => {
                     tracing::info!("✅ License removed: {}\n", result);
                 }

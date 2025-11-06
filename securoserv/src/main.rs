@@ -1,8 +1,8 @@
 mod handlers;
 mod db;
+mod admin;
 
 use tracing::info;
-
 use actix_web::{
     App,
     HttpServer,
@@ -13,11 +13,14 @@ use std::io::BufReader;
 use std::fs::File;
 use securo::server::pin::init_rustls_config;
 use securo::server::crypto::SecuroServ;
+use securo::logger::LoggerHandle;
 
 use actix_web::web::{self};
+use crate::admin::AdminSessions;
 
 pub fn configure_routes() -> impl actix_web::dev::HttpServiceFactory {
     web::scope("")
+        .route("/", web::get().to(handlers::pong))
         .service(
             web::scope("/api")
                 .route("/exchange/stage1", web::get().to(handlers::exchange_stage1))
@@ -84,10 +87,13 @@ async fn main() -> std::io::Result<()> {
 
     tracing::info!("✅ Database initialized");
 
-    // Create the server crypto instance (shared across all workers - session-based with UUID)
-    let server_crypto = web::Data::new(SecuroServ::new());
+    // Create the server crypto instance with tracing logger
+    let server_crypto = web::Data::new(
+        SecuroServ::new_with_logger(LoggerHandle::tracing())
+    );
 
     let db_data = web::Data::new(db_pool);
+    let admin_sessions = web::Data::new(AdminSessions::default());
     
     if use_tls {
         info!("Server starting with TLS and certificate pinning on https://127.0.0.1:8443/");
@@ -101,6 +107,7 @@ async fn main() -> std::io::Result<()> {
             App::new()
                 .app_data(server_crypto.clone())
                 .app_data(db_data.clone())
+                .app_data(admin_sessions.clone())
                 .wrap(Logger::default())
                 .service(configure_routes())
         })
@@ -114,6 +121,7 @@ async fn main() -> std::io::Result<()> {
             App::new()
                 .app_data(server_crypto.clone())
                 .app_data(db_data.clone())
+                .app_data(admin_sessions.clone())
                 .wrap(Logger::default())
                 .service(configure_routes())
         })

@@ -1,3 +1,5 @@
+pub mod logger;
+
 pub mod client {
     pub mod crypto;
     pub mod pin;

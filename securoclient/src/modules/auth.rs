@@ -1,7 +1,4 @@
 use securo::client::crypto::{SecuroClient, EncryptedResponse};
-use base64::engine::Engine as _;
-use ed25519_dalek::Verifier;
-use crypto_box::aead::{Aead, AeadCore};
 
 #[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -59,7 +56,6 @@ pub struct AuthResponse {
     pub refresh_token: String,
     pub token_type: String,
     pub expires_in: u64,
-    pub is_admin: bool,
 }
 
 /// Client requests server's ephemeral key
@@ -97,73 +93,24 @@ pub async fn exchange_keys_stage2(
     // Set server's X25519 public key (for regular encryption after exchange)
     crypto.set_server_public_key(&stage1_response.server_x25519_public)?;
     
-    // Verify server's signature on (server_verifying_key || server_ephemeral)
-    let server_verifying_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&stage1_response.server_verifying_key)?;
-    let server_ephemeral_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&stage1_response.server_ephemeral_public)?;
-    let signature_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&stage1_response.server_signature)?;
-    
-    use ed25519_dalek::{VerifyingKey, Signature};
-    
-    // The server_verifying_key IS the Ed25519 verifying key (32 bytes)
-    if server_verifying_bytes.len() < 32 {
-        return Err("Server verifying key too short".into());
-    }
-    
-    let verifying_key = VerifyingKey::from_bytes(
-        &server_verifying_bytes[..32].try_into()?
+    // CRYPTO: Verify server signature and extract ephemeral public key
+    let server_ephemeral_pub = crypto.verify_server_signature_stage2(
+        &stage1_response.server_verifying_key,
+        &stage1_response.server_ephemeral_public,
+        &stage1_response.server_signature,
     )?;
-    
-    if signature_bytes.len() != 64 {
-        return Err("Invalid signature length".into());
-    }
-    
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes.copy_from_slice(&signature_bytes);
-    let signature = Signature::from_bytes(&sig_bytes);
-    
-    let mut sig_message = Vec::new();
-    sig_message.extend_from_slice(&server_verifying_bytes);
-    sig_message.extend_from_slice(&server_ephemeral_bytes);
-    
-    verifying_key.verify(&sig_message, &signature)
-        .map_err(|e| format!("Signature verification failed: {:?}", e))?;
     tracing::info!("✅ Server signature verified");
-    
-    // Create payload with client keys (plain JSON that will be encrypted)
-    let client_keys_payload = serde_json::json!({
-        "client_verifying_key": crypto.get_verifying_key_base64(),
-        "client_kyber_public": crypto.get_kyber_public_base64(),
-    });
-    
-    // Encrypt using the server's ephemeral public key that was sent in stage 1
-    // This creates a fresh ephemeral shared secret for this exchange
-    use crypto_box::{SalsaBox, PublicKey as CryptoBoxPublicKey};
-    
-    let server_ephemeral_pub = {
-        if server_ephemeral_bytes.len() != 32 {
-            return Err("Invalid server ephemeral key length".into());
-        }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(&server_ephemeral_bytes);
-        CryptoBoxPublicKey::from(key_array)
-    };
-    
-    // Use client's static secret to create box with server's ephemeral public
-    let client_static_secret = crypto.get_static_secret_key();
-    let salsa_box = SalsaBox::new(&server_ephemeral_pub, client_static_secret);
-    
-    let nonce = SalsaBox::generate_nonce(&mut rand::rngs::OsRng);
-    let plaintext = client_keys_payload.to_string();
-    let ciphertext = salsa_box.encrypt(&nonce, plaintext.as_bytes())
-        .map_err(|_| "Encryption failed")?;
+
+    // CRYPTO: Encrypt client keys using server's ephemeral public key
+    let (nonce_b64, ciphertext_b64) = crypto.encrypt_client_keys_stage2(&server_ephemeral_pub)?;
     
     // For Stage 2, send client keys back to server
     // The server will decrypt using its stored ephemeral secret from Stage 1
     let stage2_req = ExchangeStage2Request {
         stage_token: stage1_response.stage_token,  // Include stage_token to bind Stage 1 to Stage 2
         client_public_key_b64: crypto.get_public_key_base64(),
-        nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&nonce[..]),
-        ciphertext: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&ciphertext),
+        nonce: nonce_b64,
+        ciphertext: ciphertext_b64,
     };
     
     let resp = client
@@ -181,35 +128,30 @@ pub async fn exchange_keys_stage2(
     
     let stage2_resp: ExchangeStage2Response = resp.json().await?;
     
-    // Decrypt stage 2 response using the same ephemeral shared secret
-    let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&stage2_resp.nonce)?;
-    let ciphertext_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&stage2_resp.ciphertext)?;
+    // CRYPTO: Decrypt stage 2 response using the ephemeral shared secret
+    let response_json = crypto.decrypt_stage2_response(
+        &stage2_resp.nonce,
+        &stage2_resp.ciphertext,
+        &server_ephemeral_pub,
+    )?;
+
+    // CRYPTO: Extract temp JWT and process response (including Kyber decapsulation)
+    let temp_jwt = crypto.process_stage2_response(&response_json)?;
     
-    if nonce_bytes.len() != 24 {
-        return Err("Invalid nonce length in response".into());
-    }
-    
-    let mut nonce_array = [0u8; 24];
-    nonce_array.copy_from_slice(&nonce_bytes);
-    let response_nonce = crypto_box::Nonce::from(nonce_array);
-    
-    let plaintext_response = salsa_box.decrypt(&response_nonce, ciphertext_bytes.as_ref())
-        .map_err(|_| "Response decryption failed")?;
-    
-    let response_json: serde_json::Value = serde_json::from_slice(&plaintext_response)?;
-    
-    let temp_jwt = response_json.get("temp_jwt")
+    // Extract kyber ciphertext for response (can be empty string if not provided)
+    let kyber_ciphertext = response_json.get("kyber_ciphertext")
         .and_then(|v| v.as_str())
-        .ok_or("Missing temp_jwt in response")?
+        .unwrap_or("")
         .to_string();
-    
-    crypto.set_session_id(temp_jwt.clone());
-    
-    // Decapsulate Kyber ciphertext for post-quantum security
-    let kyber_ciphertext = response_json.get("kyber_ciphertext").and_then(|v| v.as_str()).unwrap_or("");
-    if !kyber_ciphertext.is_empty() {
-        crypto.decapsulate_kyber(kyber_ciphertext)?;
-    }
+
+    let expires_in = response_json.get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(600);
+
+    let token_type = response_json.get("token_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Bearer")
+        .to_string();
     
     tracing::info!("✅ Exchange Stage 2 complete");
     tracing::info!("Temp JWT (10 min): {}...", &temp_jwt[..std::cmp::min(30, temp_jwt.len())]);
@@ -220,10 +162,10 @@ pub async fn exchange_keys_stage2(
         server_signature: stage1_response.server_signature,
         encrypted_verifying_key: String::new(),
         verifying_key_hmac: String::new(),
-        kyber_ciphertext: kyber_ciphertext.to_string(),
+        kyber_ciphertext,
         temp_jwt,
-        token_type: "Bearer".to_string(),
-        expires_in: 600,
+        token_type,
+        expires_in,
     })
 }
 
@@ -273,7 +215,7 @@ pub async fn unauth(
     client: &reqwest::Client,
     crypto: &SecuroClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Unauthenticating session...");
+    tracing::info!("Unauthenticaticlientng session...");
 
     let session_id = crypto.get_session_id()
         .ok_or("Session ID not set")?;

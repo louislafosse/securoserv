@@ -4,15 +4,21 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::db::{self, DbPool, Ban, AuditLog, License};
+use crate::admin::AdminSessions;
 use securo::server::crypto::{SecuroServ, EncryptedRequest, ExchangeStage2Request};
 
 /// Admin license key - used for bootstrapping admin session creation
 const ADMIN_LICENSE_KEY: &str = "b7f4c2e9-8d3a-4f1b-9e2c-5a6d7f8e9c1a-admin-bootstrap-key";
 
+pub async fn pong() -> HttpResponse {
+    HttpResponse::Ok().body("pong")
+}
+
 /// Admin: create a license for a session_id
 pub async fn admin_create_license(
     crypto: web::Data<SecuroServ>,
     db: web::Data<DbPool>,
+    admin_sessions: web::Data<AdminSessions>,
     req: web::Bytes,
 ) -> HttpResponse {
 
@@ -28,14 +34,19 @@ pub async fn admin_create_license(
 
         tracing::info!("Admin create license request (encrypted) from session: {}", &session_id[..std::cmp::min(40, session_id.len())]);
 
-        // Check if request includes is_admin flag
-        let is_admin = payload.get("is_admin")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        
-        if !is_admin {
-            tracing::warn!("Rejected admin_create_license: request is not marked as admin");
-            return HttpResponse::Unauthorized().body("Not an admin session");
+        // Extract session UUID from the JWT access token to check if it's an admin session
+        let session_uuid = match crypto.validate_access_token(&session_id) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                tracing::warn!("Invalid access token for admin_create_license: {:?}", e);
+                return HttpResponse::Unauthorized().body("Invalid session");
+            }
+        };
+
+        // Check if this session is marked as admin
+        if !admin_sessions.is_admin(&session_uuid) {
+            tracing::warn!("Rejected admin_create_license: session is not admin");
+            return HttpResponse::Unauthorized().body("Admin privileges required");
         }
 
         let expires_in = payload.get("expires_in").and_then(|v| v.as_u64());
@@ -97,6 +108,7 @@ pub async fn admin_create_license(
 pub async fn admin_remove_license(
     crypto: web::Data<SecuroServ>,
     db: web::Data<DbPool>,
+    admin_sessions: web::Data<AdminSessions>,
     req: web::Bytes,
 ) -> HttpResponse {
 
@@ -112,14 +124,19 @@ pub async fn admin_remove_license(
 
         tracing::info!("Admin remove license request (encrypted) from session: {}", &session_id[..std::cmp::min(40, session_id.len())]);
 
-        // Check if request includes is_admin flag
-        let is_admin = payload.get("is_admin")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        
-        if !is_admin {
-            tracing::warn!("Rejected admin_remove_license: request is not marked as admin");
-            return HttpResponse::Unauthorized().body("Not an admin session");
+        // Extract session UUID from the JWT access token to check if it's an admin session
+        let session_uuid = match crypto.validate_access_token(&session_id) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                tracing::warn!("Invalid access token for admin_remove_license: {:?}", e);
+                return HttpResponse::Unauthorized().body("Invalid session");
+            }
+        };
+
+        // Check if this session is marked as admin
+        if !admin_sessions.is_admin(&session_uuid) {
+            tracing::warn!("Rejected admin_remove_license: session is not admin");
+            return HttpResponse::Unauthorized().body("Admin privileges required");
         }
 
         let license_key = match payload.get("license_key").and_then(|v| v.as_str()) {
@@ -361,6 +378,7 @@ pub async fn exchange_stage2(
 pub async fn auth(
     crypto: web::Data<SecuroServ>,
     db: web::Data<DbPool>,
+    admin_sessions: web::Data<AdminSessions>,
     req: web::Json<EncryptedRequest>,
 ) -> HttpResponse {
     // Use decrypt_auth_request which accepts BOTH access and exchange tokens
@@ -443,6 +461,7 @@ pub async fn auth(
     let is_admin = license_key == ADMIN_LICENSE_KEY;
     if is_admin {
         tracing::warn!("⚠️ Admin session authenticated - marking session as admin");
+        admin_sessions.mark_as_admin(session_uuid);
     }
 
     // Generate permanent tokens
@@ -454,7 +473,6 @@ pub async fn auth(
                 refresh_token: String,
                 token_type: String,
                 expires_in: u64,
-                is_admin: bool,
             }
 
             let response = AuthSuccessResponse {
@@ -462,7 +480,6 @@ pub async fn auth(
                 refresh_token: token_pair.refresh_token,
                 token_type: token_pair.token_type,
                 expires_in: token_pair.expires_in,
-                is_admin,
             };
 
             tracing::info!("Authentication successful for session: {} (admin: {})", session_uuid, is_admin);
@@ -600,6 +617,7 @@ pub async fn send_encrypted(
 /// Unauthenticate a client session (by access token)
 pub async fn unauth(
     crypto: web::Data<SecuroServ>,
+    admin_sessions: web::Data<AdminSessions>,
     req: web::Json<EncryptedRequest>,
 ) -> HttpResponse {
     let (session_id, _payload) = match crypto.decrypt_request(&req) {
@@ -635,6 +653,9 @@ pub async fn unauth(
             return HttpResponse::InternalServerError().body("Encryption failed");
         }
     };
+
+    // Remove from admin sessions if it was marked as admin
+    admin_sessions.remove(&session_uuid);
 
     match crypto.unauth(&session_uuid.to_string()) {
         Ok(_) => {

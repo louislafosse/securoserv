@@ -1,6 +1,5 @@
 use crypto_box::{
-    aead::{Aead, AeadCore, OsRng},
-    PublicKey, SalsaBox, SecretKey,
+    PublicKey, SalsaBox, SecretKey, aead::{Aead, AeadCore, OsRng}
 };
 use serde::{Deserialize, Serialize};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE};
@@ -9,12 +8,21 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey, Algorithm};
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng as RandOsRng;
-use pqc_kyber::encapsulate;
+use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
+use pqc_kyber::{RngCore, encapsulate};
 use hmac::Hmac;
-use sha2::Sha256;
+use sha2::{
+    Sha256,
+    Digest,
+};
 use hmac::Mac;
+use crate::{
+    linfo,
+    ldebug
+};
+
+        
 
 const KYBER_1024_CIPHERTEXT_SIZE: usize = 1568;  // Kyber-1024 encapsulation produces exactly 1568 bytes
 
@@ -201,10 +209,10 @@ impl ServerError {
                 tracing::warn!("Invalid key format received");
             }
             ServerError::InvalidSession => {
-                tracing::debug!("Invalid session ID format");
+                tracing::error!("Invalid session ID format");
             }
             ServerError::SessionNotFound => {
-                tracing::debug!("Session not found - unknown or expired UUID");
+                tracing::error!("Session not found - unknown or expired UUID");
             }
             ServerError::InvalidSignature => {
                 tracing::warn!("⚠️  SECURITY: Invalid signature detected - possible MITM attack!");
@@ -213,7 +221,7 @@ impl ServerError {
                 tracing::warn!("⚠️  SECURITY: Invalid proof of possession - possible MITM attack!");
             }
             _ => {
-                tracing::debug!("Crypto error: {}", self);
+                tracing::error!("Crypto error: {}", self);
             }
         }
     }
@@ -236,27 +244,37 @@ pub struct SecuroServ {
     ephemeral_secrets: RwLock<HashMap<String, Vec<u8>>>,  // ephemeral_public_b64 -> ephemeral_secret_bytes
     // Pending exchanges - tracks Stage 1 data to validate in Stage 2 (prevents session fixation)
     pending_exchanges: RwLock<HashMap<String, PendingExchange>>,  // stage_token -> PendingExchange
+    logger: crate::logger::LoggerHandle,
 }
 
 impl SecuroServ {
+    /// Create a new SecuroServ with no logging
     pub fn new() -> Self {
+        Self::new_with_logger(crate::logger::LoggerHandle::null())
+    }
+
+    /// Create a new SecuroServ with a custom logger
+    pub fn new_with_logger(logger: crate::logger::LoggerHandle) -> Self {
         // Generate X25519 keypair for encryption
         let secret_key = SecretKey::generate(&mut OsRng);
         let public_key = secret_key.public_key();
         
         // Generate Ed25519 keypair for signing (authentication)
-        let mut csprng = RandOsRng;
+        let mut csprng = OsRng;
         let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
         
-        let random_bytes: [u8; 16] = rand::random();
+        // let random_bytes: [u8; 16] = rand::random();
+        let mut random_bytes: [u8; 16] = [0u8; 16];
+        OsRng.fill_bytes(&mut random_bytes);
+
         let random_string = BASE64_URL_SAFE.encode(random_bytes);
         let jwt_secret = format!("{}{}", random_string, Uuid::new_v4().simple());
 
-        tracing::info!("🔐 Server keypairs generated");
-        tracing::info!("📦 X25519 Public Key (encryption): {}", BASE64_URL_SAFE.encode(public_key.as_bytes()));
-        tracing::info!("✍️  Ed25519 Verifying Key (signing): {}", BASE64_URL_SAFE.encode(verifying_key.as_bytes()));
-        
+        linfo!(logger, "🔐 Server keypairs generated");
+        linfo!(logger, "📦 X25519 Public Key (encryption): {}", BASE64_URL_SAFE.encode(public_key.as_bytes()));
+        linfo!(logger, "✍️  Ed25519 Verifying Key (signing): {}", BASE64_URL_SAFE.encode(verifying_key.as_bytes()));
+
         Self {
             secret_key,
             public_key,
@@ -266,6 +284,7 @@ impl SecuroServ {
             jwt_secret,
             ephemeral_secrets: RwLock::new(HashMap::new()),
             pending_exchanges: RwLock::new(HashMap::new()),
+            logger,
         }
     }
 
@@ -281,7 +300,6 @@ impl SecuroServ {
 
     /// Sign data with server's Ed25519 private key
     fn sign_data(&self, data: &[u8]) -> Vec<u8> {
-        use ed25519_dalek::Signer;
         let signature = self.signing_key.sign(data);
         signature.to_bytes().to_vec()
     }
@@ -290,16 +308,12 @@ impl SecuroServ {
     /// Client requests this first (no parameters), server returns public keys
     /// This allows client to establish a secure channel before sending its keys
     pub fn perform_exchange_stage1(&self) -> Result<ExchangeStage1Response, ServerError> {
-        use x25519_dalek::PublicKey as X25519PublicKey;
-        
-        tracing::info!("Exchange Stage 1: Sending server ephemeral key");
-        
+        linfo!(self.logger, "Exchange Stage 1: Sending server ephemeral key");
+
         // Generate random 32 bytes for ephemeral secret (x25519 scalar)
         let mut ephemeral_secret_bytes = [0u8; 32];
-        use rand::RngCore;
-        let mut rng = RandOsRng;
-        rng.fill_bytes(&mut ephemeral_secret_bytes);
-        
+        OsRng.fill_bytes(&mut ephemeral_secret_bytes);
+
         // Convert to StaticSecret (ephemeral keys are just x25519 scalars)
         let server_ephemeral_secret = x25519_dalek::StaticSecret::from(ephemeral_secret_bytes);
         let server_ephemeral_public = X25519PublicKey::from(&server_ephemeral_secret);
@@ -343,8 +357,8 @@ impl SecuroServ {
         
         self.pending_exchanges.write().unwrap().insert(stage_token.clone(), pending);
         
-        tracing::debug!("✅ Server ephemeral key generated and signed");
-        tracing::debug!("✅ Stage token generated for session fixation protection");
+        ldebug!(self.logger, "Server ephemeral key generated and signed");
+        ldebug!(self.logger, "Stage token generated for session fixation protection");
         
         Ok(ExchangeStage1Response {
             server_x25519_public: self.get_public_key_base64(),  // X25519 key for regular encryption
@@ -357,7 +371,7 @@ impl SecuroServ {
 
     /// Stage 2 of secure exchange - Process client's encrypted keys and complete exchange
     pub fn perform_exchange_stage2(&self, req: ExchangeStage2Request) -> Result<ExchangeStage2Response, ServerError> {
-        tracing::info!("Exchange Stage 2: Processing client's encrypted keys");
+        linfo!(self.logger, "Exchange Stage 2: Processing client's encrypted keys");
         
         // VALIDATION: Check that stage_token is valid (prevents session fixation)
         // This also retrieves the stored ephemeral secret from Stage 1
@@ -370,7 +384,7 @@ impl SecuroServ {
                 })?
         };
 
-        tracing::debug!("✅ Stage token validated - Stage 1 and Stage 2 are bound together");
+        ldebug!(self.logger, "Stage token validated - Stage 1 and Stage 2 are bound together");
         
         // Extract the ephemeral secret that was stored in Stage 1
         let ephemeral_secret_bytes = pending.ephemeral_secret;
@@ -431,7 +445,7 @@ impl SecuroServ {
             .unwrap_or("")
             .to_string();
         
-        tracing::debug!("✅ Client keys decrypted successfully");
+        ldebug!(self.logger, "Client keys decrypted successfully");
         
         // Now complete the exchange with the decrypted keys
         let exchange_req = ExchangeRequest {
@@ -457,9 +471,9 @@ impl SecuroServ {
         let response_plaintext = response_payload.to_string();
         let response_ciphertext = salsa_box.encrypt(&response_nonce, response_plaintext.as_bytes())
             .map_err(|_| ServerError::EncryptionFailed)?;
-        
-        tracing::debug!("✅ Stage 2 response encrypted successfully");
-        
+
+        ldebug!(self.logger, "Stage 2 response encrypted successfully");
+
         Ok(ExchangeStage2Response {
             nonce: BASE64_URL_SAFE.encode(&response_nonce[..]),
             ciphertext: BASE64_URL_SAFE.encode(&response_ciphertext),
@@ -468,11 +482,8 @@ impl SecuroServ {
 
     /// Complete exchange with authentication - returns tokens immediately
     pub fn perform_exchange(&self, req: ExchangeRequest) -> Result<ExchangeResponse, ServerError> {
-        use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
-        use sha2::Digest;
-        
-        tracing::info!("Starting authenticated key exchange");
-        
+        linfo!(self.logger, "Starting authenticated key exchange");
+
         // Parse and validate client keys
         let client_x25519_bytes = BASE64_URL_SAFE.decode(&req.client_public_key)
             .map_err(|_| ServerError::InvalidKey)?;
@@ -488,7 +499,7 @@ impl SecuroServ {
         let client_public_key = PublicKey::from(key_array);
         
         // Generate ephemeral keypair
-        let rng = RandOsRng;
+        let rng = OsRng;
         let server_ephemeral_secret = EphemeralSecret::random_from_rng(rng);
         let server_ephemeral_public = X25519PublicKey::from(&server_ephemeral_secret);
         
@@ -543,7 +554,7 @@ impl SecuroServ {
                 .map_err(|_| ServerError::InvalidKey)?;
             
             // Encapsulate with client's Kyber public key
-            let mut rng = RandOsRng;
+            let mut rng = OsRng;
             let (ciphertext, shared_secret) = encapsulate(&client_kyber_pub_bytes, &mut rng)
                 .map_err(|_| ServerError::EncryptionFailed)?;
             
@@ -557,9 +568,9 @@ impl SecuroServ {
                 );
                 return Err(ServerError::EncryptionFailed);
             }
-            
-            tracing::debug!("✅ Kyber-1024 encapsulation produced valid {} byte ciphertext", KYBER_1024_CIPHERTEXT_SIZE);
-            
+
+            ldebug!(self.logger, "Kyber-1024 encapsulation produced valid {} byte ciphertext", KYBER_1024_CIPHERTEXT_SIZE);
+
             // Return the ciphertext for the client to decapsulate
             // shared_secret will be used for HMAC authentication of verifying_key
             (BASE64_URL_SAFE.encode(ciphertext), Some(shared_secret.to_vec()))
@@ -569,7 +580,6 @@ impl SecuroServ {
         
         // Compute HMAC of encrypted_verifying_key using Kyber shared secret (if available)
         let verifying_key_hmac = if let Some(ref kyber_ss) = kyber_shared_secret {
-            use hmac::Mac;
             let mut mac = Hmac::<Sha256>::new_from_slice(kyber_ss)
                 .map_err(|_| ServerError::EncryptionFailed)?;
             mac.update(&encrypted_with_nonce);
@@ -580,11 +590,11 @@ impl SecuroServ {
         
         // Generate temporary token for key exchange phase (10 min)
         let temp_jwt = self.generate_temp_jwt(&session_uuid)?;
-        
-        tracing::info!("Session created: {}", session_uuid);
-        tracing::info!("✅ Post-quantum Kyber-1024 KEM completed");
-        tracing::info!("✅ Ed25519 verifying key authenticated with HMAC-SHA256");
-        
+
+        linfo!(self.logger, "Session created: {}", session_uuid);
+        linfo!(self.logger, "Post-quantum Kyber-1024 KEM completed");
+        linfo!(self.logger, "Ed25519 verifying key authenticated with HMAC-SHA256");
+
         Ok(ExchangeResponse {
             server_public_key: self.get_public_key_base64(),
             server_ephemeral_public: BASE64_URL_SAFE.encode(server_ephemeral_public.as_bytes()),
@@ -646,7 +656,7 @@ impl SecuroServ {
     pub fn generate_token_pair(&self, session_id: &Uuid) -> Result<TokenPair, ServerError> {
         let access_token = self.generate_access_token(session_id)?;
         let refresh_token = self.generate_refresh_token(session_id)?;
-        tracing::info!("Generated token pair (access: {}, refresh: {})", access_token, refresh_token);
+        linfo!(self.logger, "Generated token pair (access: {}, refresh: {})", access_token, refresh_token);
 
         Ok(TokenPair {
             access_token,
@@ -755,8 +765,8 @@ impl SecuroServ {
         let mut sessions = self.sessions.write().unwrap();
         match sessions.remove(&uuid) {
             Some(_) => {
-                tracing::info!("Client unauthenticated: {}", session_id);
-                tracing::info!("Total active sessions: {}", sessions.len());
+                linfo!(self.logger, "Client unauthenticated: {}", session_id);
+                linfo!(self.logger, "Total active sessions: {}", sessions.len());
                 Ok(())
             }
             None => Err(ServerError::SessionNotFound)
@@ -955,7 +965,7 @@ impl SecuroServ {
             .unwrap()
             .as_secs() as i64;
 
-        tracing::debug!("Response encrypted and signed successfully with timestamp: {}", timestamp);
+        ldebug!(self.logger, "Response encrypted and signed successfully with timestamp: {}", timestamp);
 
         Ok(EncryptedResponse {
             nonce: nonce_b64,
