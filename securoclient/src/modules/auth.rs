@@ -77,7 +77,6 @@ pub async fn exchange_keys_stage1(
     }
     
     let stage1_resp: ExchangeStage1Response = resp.json().await?;
-    tracing::info!("✅ Stage 1 complete: Received server ephemeral key");
     
     Ok(stage1_resp)
 }
@@ -99,7 +98,7 @@ pub async fn exchange_keys_stage2(
         &stage1_response.server_ephemeral_public,
         &stage1_response.server_signature,
     )?;
-    tracing::info!("✅ Server signature verified");
+    tracing::info!("Server signature verified");
 
     // CRYPTO: Encrypt client keys using server's ephemeral public key
     let (nonce_b64, ciphertext_b64) = crypto.encrypt_client_keys_stage2(&server_ephemeral_pub)?;
@@ -152,9 +151,6 @@ pub async fn exchange_keys_stage2(
         .and_then(|v| v.as_str())
         .unwrap_or("Bearer")
         .to_string();
-    
-    tracing::info!("✅ Exchange Stage 2 complete");
-    tracing::info!("Temp JWT (10 min): {}...", &temp_jwt[..std::cmp::min(30, temp_jwt.len())]);
     
     Ok(ExchangeResponse {
         server_public_key: stage1_response.server_x25519_public,

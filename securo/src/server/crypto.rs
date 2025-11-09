@@ -17,7 +17,7 @@ use sha2::{
     Digest,
 };
 use hmac::Mac;
-use crate::{
+use crate::logger::{
     linfo,
     ldebug
 };
@@ -228,7 +228,7 @@ impl ServerError {
 }
 
 /// Server crypto state (session-based with JWT authentication + Ed25519 signing)
-#[allow(dead_code)]
+#[allow(unused)]
 pub struct SecuroServ {
     // Server's long-term X25519 keypair for encryption
     secret_key: SecretKey,
@@ -251,6 +251,11 @@ impl SecuroServ {
     /// Create a new SecuroServ with no logging
     pub fn new() -> Self {
         Self::new_with_logger(crate::logger::LoggerHandle::null())
+    }
+
+    /// Create a new SecuroServ with verbose logging
+    pub fn new_with_verbose() -> Self {
+        Self::new_with_logger(crate::logger::LoggerHandle::tracing())
     }
 
     /// Create a new SecuroServ with a custom logger

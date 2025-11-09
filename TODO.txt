@@ -1,4 +1,0 @@
-FIX:
-...
-
-at the end, just clean up and publish securo as a lib

@@ -38,18 +38,10 @@ pub struct Ban {
     pub reason: String,                // Reason for ban
     pub created_at: i64,               // Unix timestamp
     pub banned_by: Option<String>,     // Admin that issued the ban
-}
-
-#[derive(Insertable, Queryable, Clone, Debug)]
-#[diesel(table_name = reports)]
-pub struct Report {
-    pub id: String,                    // UUID
-    pub reporter_session: String,      // Session UUID of reporter
-    pub reported_session: String,      // Session UUID being reported
-    pub reason: String,                // Report reason
+    pub reporter_session: Option<String>,  // Session UUID of reporter (if reported)
+    pub reported_session: Option<String>,  // Session UUID being reported (if applicable)
     pub evidence: Option<String>,      // Additional evidence
-    pub created_at: i64,               // Unix timestamp
-    pub status: String,                // "open", "resolved", "dismissed"
+    pub status: String,                // "active", "resolved", "dismissed"
 }
 
 #[derive(Insertable, Queryable, Clone, Debug)]
