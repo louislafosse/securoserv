@@ -3,7 +3,7 @@ use serde::Serialize;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::db::{self, DbPool, Ban, AuditLog, License};
+use crate::db::{self, DbPool, Ban, AuditLog, License, Message};
 use crate::admin::AdminSessions;
 use securo::server::crypto::{SecuroServ, EncryptedRequest, ExchangeStage2Request};
 
@@ -288,6 +288,12 @@ pub async fn report(
             }
         };
 
+        // Get session UUID for audit/report tracking
+        let reporter_uuid = match crypto.validate_access_token(&session_id) {
+            Ok(uuid) => uuid.to_string(),
+            Err(_) => "unknown".to_string(),
+        };
+
         // Ban by session_id
         let ban = Ban {
             id: Uuid::new_v4().to_string(),
@@ -295,7 +301,11 @@ pub async fn report(
             ban_type: "session".to_string(),
             reason: "client-reported debugger".to_string(),
             created_at: Utc::now().timestamp(),
-            banned_by: None,
+            banned_by: Some(reporter_uuid.clone()),
+            reporter_session: Some(reporter_uuid.clone()),
+            reported_session: Some(session_id.clone()),
+            evidence: Some(format!("hwid: {}", hwid)),
+            status: "active".to_string(),
         };
         if let Err(e) = db::insert_ban(&db, ban) {
             tracing::error!("Failed to save ban to database: {:?}", e);
@@ -308,10 +318,30 @@ pub async fn report(
             ban_type: "hardware".to_string(),
             reason: "client-reported debugger".to_string(),
             created_at: Utc::now().timestamp(),
-            banned_by: None,
+            banned_by: Some(reporter_uuid.clone()),
+            reporter_session: Some(reporter_uuid.clone()),
+            reported_session: Some(session_id.clone()),
+            evidence: Some(format!("hwid: {}", hwid)),
+            status: "active".to_string(),
         };
         if let Err(e) = db::insert_ban(&db, hwid_ban) {
             tracing::error!("Failed to save HWID ban to database: {:?}", e);
+        }
+        
+        // Audit log
+        let audit = AuditLog {
+            id: Uuid::new_v4().to_string(),
+            session_uuid: Some(reporter_uuid),
+            event_type: "security_report".to_string(),
+            event_data: serde_json::json!({
+                "reported_session": session_id,
+                "hwid": hwid,
+            }).to_string(),
+            created_at: Utc::now().timestamp(),
+            ip_address: None,
+        };
+        if let Err(e) = db::insert_audit_log(&db, audit) {
+            tracing::error!("Failed to save audit log: {:?}", e);
         }
 
         let response = serde_json::json!({"status": "banned"});
@@ -349,6 +379,7 @@ pub async fn exchange_stage1(
 /// Client sends client_public_key_b64 and receives encrypted exchange response
 pub async fn exchange_stage2(
     crypto: web::Data<SecuroServ>,
+    _db: web::Data<DbPool>,
     body: web::Bytes,
 ) -> HttpResponse {
     // Parse the request
@@ -467,6 +498,43 @@ pub async fn auth(
     // Generate permanent tokens
     match crypto.generate_token_pair(&session_uuid) {
         Ok(token_pair) => {
+            // Persist session to database
+            let now = Utc::now().timestamp();
+            let session = db::Session {
+                id: Uuid::new_v4().to_string(),
+                session_uuid: session_uuid.to_string(),
+                license_key: license_key.to_string(),
+                hardware_id: None,
+                client_public_key: vec![],
+                client_verifying_key: String::new(),
+                client_kyber_public: String::new(),
+                created_at: now,
+                last_heartbeat: now,
+                is_authenticated: true,
+            };
+            
+            if let Err(e) = db::insert_session(&db, session) {
+                tracing::warn!("Failed to persist session to DB: {:?}", e);
+            } else {
+                tracing::debug!("✅ Session persisted to database");
+            }
+            
+            // Audit log: authentication
+            let audit = AuditLog {
+                id: Uuid::new_v4().to_string(),
+                session_uuid: Some(session_uuid.to_string()),
+                event_type: "auth".to_string(),
+                event_data: serde_json::json!({
+                    "license_key": license_key,
+                    "is_admin": is_admin,
+                }).to_string(),
+                created_at: now,
+                ip_address: None,
+            };
+            if let Err(e) = db::insert_audit_log(&db, audit) {
+                tracing::error!("Failed to save auth audit log: {:?}", e);
+            }
+
             #[derive(Serialize)]
             struct AuthSuccessResponse {
                 access_token: String,
@@ -504,6 +572,7 @@ pub async fn auth(
 /// Receive encrypted message (POST)
 pub async fn receive_encrypted(
     crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
     req: web::Json<EncryptedRequest>,
 ) -> HttpResponse {
     // Decrypt the request
@@ -519,10 +588,44 @@ pub async fn receive_encrypted(
 
     tracing::debug!("Received encrypted message from session: {}", &session_id[..std::cmp::min(40, session_id.len())]);
 
-
     let message = payload.get("message")
         .and_then(|m| m.as_str())
         .unwrap_or("Message received");
+
+    // Validate access token and get session UUID
+    let session_uuid = match crypto.validate_access_token(&session_id) {
+        Ok(uuid) => uuid.to_string(),
+        Err(_) => "unknown".to_string(),
+    };
+    
+    // Store message in database
+    let msg = Message {
+        id: Uuid::new_v4().to_string(),
+        sender_session: session_uuid.clone(),
+        recipient_session: None, // Broadcast/server message
+        content: message.to_string(),
+        created_at: Utc::now().timestamp(),
+        is_delivered: true,
+        delivered_at: Some(Utc::now().timestamp()),
+    };
+    if let Err(e) = db::insert_message(&db, msg) {
+        tracing::warn!("Failed to store received message in DB: {:?}", e);
+    }
+    
+    // Audit log: message received
+    let audit = AuditLog {
+        id: Uuid::new_v4().to_string(),
+        session_uuid: Some(session_uuid.clone()),
+        event_type: "message_received".to_string(),
+        event_data: serde_json::json!({
+            "message_preview": message.chars().take(50).collect::<String>(),
+        }).to_string(),
+        created_at: Utc::now().timestamp(),
+        ip_address: None,
+    };
+    if let Err(e) = db::insert_audit_log(&db, audit) {
+        tracing::debug!("Failed to save message received log: {:?}", e);
+    }
 
     // Encrypt the response with the received message (server echoes it back)
     let response_payload = serde_json::json!({
@@ -579,6 +682,7 @@ pub async fn get_encrypted(
 /// Send an encrypted message to a session (via encrypted request/response)
 pub async fn send_encrypted(
     crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
     req: web::Json<EncryptedRequest>,
 ) -> HttpResponse {
     let (session_id, payload) = match crypto.decrypt_request(&req) {
@@ -595,6 +699,41 @@ pub async fn send_encrypted(
     let message = payload.get("message")
         .and_then(|m| m.as_str())
         .unwrap_or("Hello from server");
+
+    // Validate access token and get session UUID
+    let session_uuid = match crypto.validate_access_token(&session_id) {
+        Ok(uuid) => uuid.to_string(),
+        Err(_) => "unknown".to_string(),
+    };
+    
+    // Store message in database
+    let msg = Message {
+        id: Uuid::new_v4().to_string(),
+        sender_session: session_uuid.clone(),
+        recipient_session: None, // Broadcast/server message
+        content: message.to_string(),
+        created_at: Utc::now().timestamp(),
+        is_delivered: true,
+        delivered_at: Some(Utc::now().timestamp()),
+    };
+    if let Err(e) = db::insert_message(&db, msg) {
+        tracing::warn!("Failed to store sent message in DB: {:?}", e);
+    }
+    
+    // Audit log: message sent
+    let audit = AuditLog {
+        id: Uuid::new_v4().to_string(),
+        session_uuid: Some(session_uuid),
+        event_type: "message_sent".to_string(),
+        event_data: serde_json::json!({
+            "message_preview": message.chars().take(50).collect::<String>(),
+        }).to_string(),
+        created_at: Utc::now().timestamp(),
+        ip_address: None,
+    };
+    if let Err(e) = db::insert_audit_log(&db, audit) {
+        tracing::debug!("Failed to save message sent log: {:?}", e);
+    }
 
     let response_payload = serde_json::json!({
         "message": message,
@@ -617,6 +756,7 @@ pub async fn send_encrypted(
 /// Unauthenticate a client session (by access token)
 pub async fn unauth(
     crypto: web::Data<SecuroServ>,
+    db: web::Data<DbPool>,
     admin_sessions: web::Data<AdminSessions>,
     req: web::Json<EncryptedRequest>,
 ) -> HttpResponse {
@@ -656,6 +796,24 @@ pub async fn unauth(
 
     // Remove from admin sessions if it was marked as admin
     admin_sessions.remove(&session_uuid);
+    
+    // Update session in DB to mark as unauthenticated
+    if let Err(e) = db::update_session_authenticated(&db, &session_uuid.to_string(), false) {
+        tracing::warn!("Failed to update session auth status in DB: {:?}", e);
+    }
+    
+    // Audit log: unauthentication
+    let audit = AuditLog {
+        id: Uuid::new_v4().to_string(),
+        session_uuid: Some(session_uuid.to_string()),
+        event_type: "unauth".to_string(),
+        event_data: serde_json::json!({}).to_string(),
+        created_at: Utc::now().timestamp(),
+        ip_address: None,
+    };
+    if let Err(e) = db::insert_audit_log(&db, audit) {
+        tracing::error!("Failed to save unauth audit log: {:?}", e);
+    }
 
     match crypto.unauth(&session_uuid.to_string()) {
         Ok(_) => {

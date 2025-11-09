@@ -8,11 +8,14 @@ mod modules {
 }
 
 use securo::client::crypto::SecuroClient;
+use securo::tls::TlsMode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut _guard = None;
+    let env_cert = include_bytes!("../../securoserv/cert.pem");
+    let env_key = include_bytes!("../../securoserv/key.pem");
 
     if std::env::var("SERVER_LOG").unwrap_or_default() == "true" {
         let file_appender = tracing_appender::rolling::RollingFileAppender::new(
@@ -39,15 +42,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    tracing::info!("Starting SecuroClient with certificate pinning and end-to-end encryption\n");
+    tracing::info!("Starting SecuroClient (E2EE) with mTLS and certificate pinning\n");
 
     // Get machine ID for anti-debug and ban system
     let machine_id = modules::antidebug::get_machine_id()?;
     tracing::info!("Machine ID: {}\n", machine_id);
 
-    // Create pinned HTTP client
-    let client = modules::client::create_pinned_client(include_bytes!("../../securoserv/cert.pem").to_vec())?;
-    tracing::info!("🔒 Certificate pinning enabled");
+    // Create pinned HTTP client with random pin (pins are embedded at compile time)
+    let client = modules::client::create_pinned_client(env_cert, Some(env_key), TlsMode::MutualTlsPinning)?;
+    tracing::info!("🔒 Certificate pinning enabled (compile-time pins embedded)");
     tracing::info!(" ↪  SSL pinning set");
 
     tracing::info!("Test 1: Testing server connection...");
@@ -106,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         
         if resp.status() == 401 {
-            tracing::info!("  ✅ {} → Rejected (401)", endpoint);
+            tracing::info!("{} → Rejected (401)", endpoint);
         } else {
             tracing::warn!("  ⚠️ {} → Accepted with status {}", endpoint, resp.status());
             all_rejected = false;

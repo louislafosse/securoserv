@@ -18,21 +18,12 @@ echo "   - cert.pem (server + client certificate)"
 echo "   - key.pem (private key)"
 echo ""
 echo "To test the server:"
-echo "  USE_TLS=true cargo run"
+echo "  USE_TLS=true cargo run --release"
 echo ""
 echo "To test with curl (using the same cert as client):"
 echo "  curl --cacert cert.pem --cert cert.pem --key key.pem https://127.0.0.1:8443/"
 echo ""
 echo "To test rejection (without client cert):"
+echo "  curl https://127.0.0.1:8443/"
+echo "Or with insecure :"
 echo "  curl -k https://127.0.0.1:8443/"
-echo "  (should fail with TLS handshake error)"
-
-# rm *.csr
-# rm *.srl
-# rm *.cnf
-# rm ca.cert.pem
-# rm ca.key.pem
-# rm client.cert.pem
-# # rm client-key.pem
-# # rm client.pem
-# rm server.cert.pem

@@ -9,7 +9,7 @@ use pqc_kyber::{keypair, decapsulate};
 use std::time::{SystemTime, UNIX_EPOCH};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use crate::linfo;
+use crate::logger::linfo;
 
 const KYBER_1024_CIPHERTEXT_SIZE: usize = 1568;  // Kyber-1024 encapsulation produces exactly 1568 bytes
 
@@ -45,7 +45,7 @@ pub struct EncryptedResponse {
 
 /// Client crypto state (session-based - generates ephemeral keys and stores session ID)
 #[derive(Clone)]
-#[allow(dead_code)]
+#[allow(unused)]
 pub struct SecuroClient {
     // Static X25519 keypair (persists across sessions)
     static_secret_key: SecretKey,
@@ -72,8 +72,14 @@ pub struct SecuroClient {
 
 impl SecuroClient {
 
+    /// Create a client crypto instance with no logging
     pub fn new() -> Self {
         Self::new_with_logger(crate::logger::LoggerHandle::null())
+    }
+
+    // Create a client crypto instance with verbose logging enabled
+    pub fn new_with_verbose() -> Self {
+        Self::new_with_logger(crate::logger::LoggerHandle::tracing())
     }
 
     /// Create a client crypto instance with fresh X25519 (static + ephemeral), Ed25519, and Kyber-1024 keypairs
@@ -439,11 +445,10 @@ impl SecuroClient {
         self.set_session_id(temp_jwt.clone());
         
         // Decapsulate Kyber ciphertext if present
-        if let Some(kyber_ct) = response_json.get("kyber_ciphertext").and_then(|v| v.as_str()) {
-            if !kyber_ct.is_empty() {
+        if let Some(kyber_ct) = response_json.get("kyber_ciphertext").and_then(|v| v.as_str())
+            && !kyber_ct.is_empty() {
                 self.decapsulate_kyber(kyber_ct)?;
             }
-        }
         
         Ok(temp_jwt)
     }

@@ -154,9 +154,5 @@ pub async fn check_license(
     let encrypted_resp: EncryptedResponse = resp.json().await?;
     let response_data = crypto.decrypt_response(&encrypted_resp)?;
     
-    let is_valid = response_data.get("valid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    
-    Ok(is_valid.to_string())
+    Ok(response_data.get("status").unwrap().to_string())
 }

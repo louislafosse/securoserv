@@ -52,17 +52,11 @@ pub fn run_migrations(db: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
             ban_type TEXT NOT NULL,
             reason TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            banned_by TEXT
-        )",
-        
-        "CREATE TABLE IF NOT EXISTS reports (
-            id TEXT PRIMARY KEY NOT NULL,
-            reporter_session TEXT NOT NULL,
-            reported_session TEXT NOT NULL,
-            reason TEXT NOT NULL,
+            banned_by TEXT,
+            reporter_session TEXT,
+            reported_session TEXT,
             evidence TEXT,
-            created_at INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'open'
+            status TEXT NOT NULL DEFAULT 'active'
         )",
         
         "CREATE TABLE IF NOT EXISTS messages (
@@ -110,6 +104,14 @@ pub fn run_migrations(db: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
+    // Migrate reports table into bans (if reports exists)
+    let migrate_reports = "INSERT OR IGNORE INTO bans (id, banned_entity, ban_type, reason, created_at, banned_by, reporter_session, reported_session, evidence, status) 
+                           SELECT id, reported_session, 'session', reason, created_at, NULL, reporter_session, reported_session, evidence, status FROM reports WHERE NOT EXISTS (SELECT 1 FROM bans WHERE bans.reported_session = reports.reported_session)";
+    match sql_query(migrate_reports).execute(&mut *conn) {
+        Ok(_) => tracing::debug!("✅ Reports migration completed"),
+        Err(_) => tracing::debug!("ℹ️ Reports table not found (expected for fresh install)"),
+    }
+    
     Ok(())
 }
 
@@ -139,7 +141,7 @@ pub fn init_admin_license(db: &DbPool) -> Result<(), Box<dyn std::error::Error>>
         .bind::<diesel::sql_types::Text, _>("admin")
         .execute(&mut *conn) {
         Ok(_) => {
-            tracing::info!("✅ Admin license initialized successfully : {}", admin_license_key);
+            tracing::info!("Admin license initialized successfully : {}", admin_license_key);
             Ok(())
         }
         Err(e) => {

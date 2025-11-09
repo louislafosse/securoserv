@@ -8,12 +8,9 @@ use actix_web::{
     HttpServer,
     middleware::Logger
 };
-
-use std::io::BufReader;
-use std::fs::File;
 use securo::server::pin::init_rustls_config;
 use securo::server::crypto::SecuroServ;
-use securo::logger::LoggerHandle;
+use securo::tls::TlsMode;
 
 use actix_web::web::{self};
 use crate::admin::AdminSessions;
@@ -85,24 +82,23 @@ async fn main() -> std::io::Result<()> {
     db::init::init_admin_license(&db_pool)
         .expect("Failed to initialize admin license");
 
-    tracing::info!("✅ Database initialized");
+    tracing::info!("Database initialized");
 
     // Create the server crypto instance with tracing logger
     let server_crypto = web::Data::new(
-        SecuroServ::new_with_logger(LoggerHandle::tracing())
+        SecuroServ::new_with_verbose()
     );
 
     let db_data = web::Data::new(db_pool);
     let admin_sessions = web::Data::new(AdminSessions::default());
     
     if use_tls {
-        info!("Server starting with TLS and certificate pinning on https://127.0.0.1:8443/");
-        
-        let cert_file = &mut BufReader::new(File::open("cert.pem").expect("Cannot open cert.pem"));
-        let key_file = &mut BufReader::new(File::open("key.pem").expect("Cannot open key.pem"));
+        info!("Server starting with mTLS and certificate pinning on https://127.0.0.1:8443/");
 
-        let config = init_rustls_config(cert_file, key_file);
-        
+        let cert = include_bytes!("../cert.pem");
+        let key = include_bytes!("../key.pem");
+        let config = init_rustls_config(cert, key, TlsMode::MutualTlsPinning);
+
         HttpServer::new(move || {
             App::new()
                 .app_data(server_crypto.clone())

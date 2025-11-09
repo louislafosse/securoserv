@@ -37,17 +37,9 @@ table! {
         reason -> Text,
         created_at -> BigInt,
         banned_by -> Nullable<Text>,
-    }
-}
-
-table! {
-    reports (id) {
-        id -> Text,
-        reporter_session -> Text,
-        reported_session -> Text,
-        reason -> Text,
+        reporter_session -> Nullable<Text>,
+        reported_session -> Nullable<Text>,
         evidence -> Nullable<Text>,
-        created_at -> BigInt,
         status -> Text,
     }
 }
@@ -80,7 +72,6 @@ allow_tables_to_appear_in_same_query!(
     sessions,
     licenses,
     bans,
-    reports,
     messages,
     audit_logs,
 );

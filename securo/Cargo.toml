@@ -1,7 +1,16 @@
 [package]
 name = "securo"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2024"
+authors = ["github.com/louislafosse"]
+description = "Cryptographic impl for hybrid classical-post-quantum authentication and secure communication"
+license = "MIT"  # or your preferred license
+repository = "https://github.com/louislafosse/securo/tree/main/securo"
+homepage = "https://github.com/louislafosse/securo"
+documentation = "https://docs.rs/securo"
+readme = "README.md"
+keywords = ["cryptography", "kyber", "x25519", "ed25519", "tls"]
+categories = ["cryptography", "authentication"]
 
 [profile.release]
 opt-level = 3
@@ -16,8 +25,6 @@ debug = false
 [profile.dev]
 incremental = true
 debug = true
-
-
 
 [dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["ring"]}
